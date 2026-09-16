@@ -1,0 +1,112 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":disableRateLimiting",
+    "mergeConfidence:all-badges"
+  ],
+  "baseBranches": ["dev"],
+  "schedule": ["on saturday"],
+  "timezone": "UTC",
+  "labels": ["dependencies", "renovate"],
+  "prBodyColumns": [
+    "Package",
+    "Type",
+    "Update",
+    "Change",
+    "Age",
+    "Adoption",
+    "Passing",
+    "Confidence",
+    "Pending"
+  ],
+  "prBodyNotes": [
+    "Please review the changelog and release notes before merging."
+  ],
+  "assignees": ["swve"],
+  "reviewers": ["swve"],
+  "fetchChangeLogs": "pr",
+  "minimumReleaseAge": "3 days",
+  "rebaseWhen": "behind-base-branch",
+  "vulnerabilityAlerts": {
+    "labels": ["security", "renovate"],
+    "schedule": ["at any time"]
+  },
+  "ignoreDeps": ["@icons-pack/react-simple-icons", "prosemirror-transform", "python"],
+  "packageRules": [
+    {
+      "matchPackageNames": ["next", "@next/*", "eslint-config-next"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Next.js",
+      "groupSlug": "nextjs"
+    },
+    {
+      "matchPackageNames": ["react", "react-dom", "@types/react*", "react-*"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "React",
+      "groupSlug": "react"
+    },
+    {
+      "matchPackageNames": ["typescript", "@types/*"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "TypeScript & types",
+      "groupSlug": "typescript"
+    },
+    {
+      "matchPackageNames": ["eslint*", "@eslint/*"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "ESLint",
+      "groupSlug": "eslint"
+    },
+    {
+      "matchPackageNames": [
+        "fastapi", "uvicorn", "pydantic", "python-multipart", "python-dotenv",
+        "sqlmodel", "sqlalchemy", "sqlalchemy-utils", "alembic", "alembic-postgresql-enum", "psycopg2-binary", "pgvector",
+        "boto3", "botocore",
+        "redis",
+        "stripe", "resend", "workos",
+        "httpx", "requests", "pyyaml", "beautifulsoup4", "pypdf",
+        "pyjwt", "pwdlib",
+        "sentry-sdk", "logfire",
+        "protobuf", "dnspython", "defusedxml", "typer", "faker",
+        "google-genai", "tiktoken", "llama-index-core",
+        "pytest", "pytest-cov", "pytest-asyncio"
+      ],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "Python backend",
+      "groupSlug": "python-backend"
+    },
+    {
+      "matchManagers": ["dockerfile"],
+      "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+      "groupName": "Docker base images",
+      "groupSlug": "docker"
+    },
+    {
+      "matchManagers": ["pep621"],
+      "rangeStrategy": "pin"
+    },
+    {
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "all non-major dependencies",
+      "groupSlug": "all-minor-patch"
+    },
+    {
+      "description": "workos declares a cryptography floor and both are pinned exactly. Split across two PRs, neither one resolves — uv fails the lock and every PR that touches them goes red. This rule is last so it wins over the groups above.",
+      "matchPackageNames": ["workos", "cryptography"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "groupName": "workos & cryptography",
+      "groupSlug": "workos-cryptography"
+    },
+    {
+      "description": "TypeScript 7 is the native compiler; @typescript-eslint 8.x still crashes on it (ts.ModuleKind.Cjs is undefined), which takes next-lint down with ESLint exit 2. Lift this cap once typescript-eslint ships TypeScript 7 support.",
+      "matchPackageNames": ["typescript"],
+      "allowedVersions": "<7"
+    },
+    {
+      "description": "rehype-katex and react-katex both require katex ^0.16, so a 0.17+ direct dependency resolves to a second nested copy: math is rendered with 0.16 class names while the katex.min.css we import carries the renamed 0.18 ones (.base -> .katex-base) and comes out unstyled. Lift this cap once both libraries support the newer major.",
+      "matchPackageNames": ["katex"],
+      "allowedVersions": "<0.17"
+    }
+  ]
+}

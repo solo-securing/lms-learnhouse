@@ -1,0 +1,758 @@
+import os
+import yaml
+from typing import Literal, Optional
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# One-shot guard for the missing-credential report below: config is loaded on
+# every request, and repeating the report drowns out every other startup log.
+_LOGGED_MISSING_INTERNAL_KEYS = False
+
+
+class CookieConfig(BaseModel):
+    domain: str
+
+
+class SentryConfig(BaseModel):
+    dsn: str | None
+
+
+class TinybirdConfig(BaseModel):
+    api_url: str        # e.g., "https://api.europe-west2.gcp.tinybird.co"
+    ingest_token: str   # Token with DATASOURCE:APPEND scope
+    read_token: str     # Token with PIPE:READ or SQL:READ scope
+
+
+class Judge0Config(BaseModel):
+    api_url: str
+    client_id: str | None
+    client_secret: str | None
+
+
+class GeneralConfig(BaseModel):
+    development_mode: bool
+    sentry_config: SentryConfig
+    saas_mode: bool
+    env: str
+
+
+class SecurityConfig(BaseModel):
+    auth_jwt_secret_key: str
+
+
+class AIConfig(BaseModel):
+    is_ai_enabled: bool | None
+    # Provider-agnostic generation config (Pydantic AI). `provider` selects the SDK
+    # ("google" | "openai" | "anthropic" | "deepseek" | "moonshot" | "mistral" | "openrouter" | "bedrock"
+    # | "ollama" | ...); `api_key`/`base_url` are the single credentials used regardless of
+    # provider. For "openrouter" base_url is auto-set; for "bedrock" use standard AWS
+    # credentials (env/role/profile) + AWS_REGION, with api_key optional.
+    provider: str | None = None
+    api_key: str | None = None
+    base_url: str | None = None
+    # Three model tiers (provider-specific strings). Defaults to the Gemini 3 family when
+    # unset — see src/services/ai/llm/tiers.py.
+    model_fast: str | None = None
+    model_standard: str | None = None
+    model_pro: str | None = None
+    # RAG embeddings follow the chosen provider where it supports embeddings (Google, OpenAI
+    # family incl. Ollama). Optionally override the embeddings provider/model/dimensions.
+    # Output dimensions default to 768 to match the Vector(768) pgvector column.
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
+    embedding_dimensions: int | None = None
+    # Google/Gemini key. Doubles as the embeddings fallback for providers (Anthropic, DeepSeek,
+    # Moonshot, Mistral, OpenRouter, Bedrock) that have no embeddings API of their own.
+    gemini_api_key: str | None = None
+    # Image generation model (Google "nano banana" family). Image generation is a
+    # Google-only path — it always uses the Google GenAI SDK regardless of the
+    # configured text `provider`, resolving its key from `api_key` (when provider
+    # is Google) or `gemini_api_key`. Override the exact model id with
+    # LEARNHOUSE_AI_IMAGE_MODEL; defaults to the GA `gemini-2.5-flash-image`
+    # (Nano Banana). Set a newer/preview model here once it is allowlisted.
+    image_model: str | None = None
+    # Text-to-speech / podcast model (Google Gemini TTS). Like image generation
+    # this is a Google-only path resolving its key from `api_key` (when provider
+    # is Google) or `gemini_api_key`. Override the exact model id with
+    # LEARNHOUSE_AI_TTS_MODEL; defaults to `gemini-2.5-flash-preview-tts`. All
+    # Gemini TTS models are currently preview, so keep this configurable.
+    tts_model: str | None = None
+
+
+class S3ApiConfig(BaseModel):
+    bucket_name: str | None
+    endpoint_url: str | None
+
+
+class ContentDeliveryConfig(BaseModel):
+    type: Literal["filesystem", "s3api"]
+    s3api: S3ApiConfig
+
+
+class HostingConfig(BaseModel):
+    tenancy: Literal["multi", "single"]
+    domain: str
+    frontend_domain: str
+    ssl: bool
+    port: int
+    use_default_org: bool
+    allowed_origins: list
+    allowed_regexp: str
+    self_hosted: bool
+    cookie_config: CookieConfig
+    content_delivery: ContentDeliveryConfig
+
+
+class MailingConfig(BaseModel):
+    email_provider: Literal["resend", "smtp"]
+    system_email_address: str
+    # Display name only. The From ADDRESS is always ``system_email_address``:
+    # it is the domain carrying the verified SPF/DKIM records, so making it
+    # configurable would break DKIM alignment and burn a shared sending
+    # reputation. Organizations may override this name per-org; see
+    # ``src/services/email/sender.py``.
+    system_email_sender_name: Optional[str] = "LearnHouse"
+    resend_api_key: Optional[str] = None
+    smtp_host: Optional[str] = None
+    smtp_port: Optional[int] = 587
+    smtp_username: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_use_tls: Optional[bool] = True
+
+
+class DatabaseConfig(BaseModel):
+    sql_connection_string: Optional[str]
+
+
+class RedisConfig(BaseModel):
+    redis_connection_string: Optional[str]
+
+
+class InternalStripeConfig(BaseModel):
+    stripe_secret_key: str | None
+    stripe_publishable_key: str | None
+    stripe_webhook_standard_secret: str | None
+    stripe_webhook_connect_secret: str | None
+    stripe_client_id: str | None
+
+
+class InternalPaymentsConfig(BaseModel):
+    stripe: InternalStripeConfig
+
+
+class LearnHouseConfig(BaseModel):
+    site_name: str
+    site_description: str
+    contact_email: str
+    general_config: GeneralConfig
+    hosting_config: HostingConfig
+    database_config: DatabaseConfig
+    redis_config: RedisConfig
+    security_config: SecurityConfig
+    ai_config: AIConfig
+    mailing_config: MailingConfig
+    payments_config: InternalPaymentsConfig
+    tinybird_config: TinybirdConfig | None
+    judge0_config: Judge0Config | None
+
+
+def _env_bool(env_value, yaml_value):
+    """Resolve a boolean setting from an env string, falling back to YAML.
+
+    Env vars arrive as strings, and `"false" or yaml_value` evaluates to the
+    string "false" — which is truthy. So `LEARNHOUSE_SELF_HOSTED=false` used to
+    read as True and pin tenancy to "single", collapsing the CORS regex and
+    making the session cookie host-only; `LEARNHOUSE_SSL=false` produced https
+    magic links on a plain-HTTP install. Both failed with no error, and
+    explicitly disabling a flag is the natural way to write it.
+
+    `development_mode` and `saas_mode` already parse correctly above; this is
+    the same logic for the settings that were still using bare `or`.
+    """
+    value = yaml_value if env_value is None or env_value == "" else env_value
+    if value is None or isinstance(value, bool):
+        return value
+    # YAML gives a real bool for `ssl: false` but a string for `ssl: "false"`,
+    # and the quoted form is easy to write by accident. Parse both sides the
+    # same way rather than only fixing the env side.
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+_yaml_cache: dict = {}
+
+
+def _load_yaml_config(yaml_path: str) -> dict:
+    """Parse config.yaml, memoised on (path, mtime, size).
+
+    Parsing dominates the cost of building the config — roughly 9ms of a 10ms
+    call, since this function is not otherwise cached and every caller re-reads
+    the file. That was tolerable while config was read at startup, and stopped
+    being tolerable once /instance/info began resolving deployment mode per
+    request.
+
+    Only the file parse is cached. Every environment variable is still read
+    live on each call, so nothing that reads env changes behaviour, and tests
+    that mutate the environment between calls keep working. Editing the file
+    invalidates on mtime/size, which keeps local edit-reload behaviour intact.
+    """
+    try:
+        st = os.stat(yaml_path)
+        key = (yaml_path, st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+
+    if key is not None and key in _yaml_cache:
+        return _yaml_cache[key]
+
+    with open(yaml_path, "r", encoding="utf-8") as f:
+        parsed = yaml.safe_load(f)
+
+    # Defensive: an empty file parses to None.
+    parsed = parsed if parsed is not None else {}
+
+    if key is not None:
+        _yaml_cache.clear()  # only ever one live config file
+        _yaml_cache[key] = parsed
+    return parsed
+
+
+def get_learnhouse_config() -> LearnHouseConfig:
+
+    load_dotenv()
+
+    # Get the YAML file
+    yaml_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+
+    yaml_config = _load_yaml_config(yaml_path)
+
+    # General Config
+
+    # Development Mode
+    env_development_mode_str = os.environ.get("LEARNHOUSE_DEVELOPMENT_MODE", "None")
+    if env_development_mode_str != "None":
+        env_development_mode = env_development_mode_str.lower() in ("true", "1", "yes")
+    else:
+        env_development_mode = None
+    development_mode = (
+        env_development_mode
+        if env_development_mode is not None
+        else yaml_config.get("general", {}).get("development_mode")
+    )
+
+    # Sentry config
+    env_sentry_dsn = os.environ.get("LEARNHOUSE_SENTRY_DSN")
+    sentry_dsn = env_sentry_dsn or yaml_config.get("general", {}).get("sentry_dsn")
+
+    # Environment (dev or prod)
+    learnhouse_env = os.environ.get("LEARNHOUSE_ENV", "dev")
+
+    # SaaS Mode (enables plan-based gating and usage limits)
+    env_saas_mode = os.environ.get("LEARNHOUSE_SAAS", "None")
+    saas_mode = (
+        env_saas_mode.lower() in ("true", "1", "yes") if env_saas_mode != "None"
+        else yaml_config.get("general", {}).get("saas_mode", False)
+    )
+
+    # Security Config
+    env_auth_jwt_secret_key = os.environ.get("LEARNHOUSE_AUTH_JWT_SECRET_KEY")
+    auth_jwt_secret_key = env_auth_jwt_secret_key or yaml_config.get(
+        "security", {}
+    ).get("auth_jwt_secret_key")
+
+    # SECURITY: Validate JWT secret key exists and has sufficient entropy
+    if not auth_jwt_secret_key:
+        raise ValueError(
+            "SECURITY ERROR: LEARNHOUSE_AUTH_JWT_SECRET_KEY must be set. "
+            "Generate a secure key with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+        )
+    if len(auth_jwt_secret_key) < 32:
+        raise ValueError(
+            "SECURITY ERROR: LEARNHOUSE_AUTH_JWT_SECRET_KEY must be at least 32 characters. "
+            "Current length: {}. Generate a secure key with: python -c \"import secrets; print(secrets.token_urlsafe(32))\"".format(
+                len(auth_jwt_secret_key)
+            )
+        )
+
+    # Check if environment variables are defined
+    env_site_name = os.environ.get("LEARNHOUSE_SITE_NAME")
+    env_site_description = os.environ.get("LEARNHOUSE_SITE_DESCRIPTION")
+    env_contact_email = os.environ.get("LEARNHOUSE_CONTACT_EMAIL")
+    env_domain = os.environ.get("LEARNHOUSE_DOMAIN")
+    os.environ.get("LEARNHOUSE_PORT")
+    env_ssl = os.environ.get("LEARNHOUSE_SSL")
+    env_port = os.environ.get("LEARNHOUSE_PORT")
+    env_use_default_org = os.environ.get("LEARNHOUSE_USE_DEFAULT_ORG")
+    env_allowed_origins = os.environ.get("LEARNHOUSE_ALLOWED_ORIGINS")
+    env_cookie_domain = os.environ.get("LEARNHOUSE_COOKIE_DOMAIN")
+    env_frontend_domain = os.environ.get("LEARNHOUSE_FRONTEND_DOMAIN")
+    env_tenancy = os.environ.get("LEARNHOUSE_TENANCY")
+
+    # Allowed origins should be a comma separated string
+    if env_allowed_origins:
+        env_allowed_origins = env_allowed_origins.split(",")
+    env_allowed_regexp = os.environ.get("LEARNHOUSE_ALLOWED_REGEXP")
+    env_self_hosted = os.environ.get("LEARNHOUSE_SELF_HOSTED")
+    env_sql_connection_string = os.environ.get("LEARNHOUSE_SQL_CONNECTION_STRING")
+
+    
+
+    # Fill in values with YAML file if they are not provided
+    site_name = env_site_name or yaml_config.get("site_name")
+    site_description = env_site_description or yaml_config.get("site_description")
+    contact_email = env_contact_email or yaml_config.get("contact_email")
+
+    domain = env_domain or yaml_config.get("hosting_config", {}).get("domain")
+    ssl = _env_bool(env_ssl, yaml_config.get("hosting_config", {}).get("ssl"))
+    port = env_port or yaml_config.get("hosting_config", {}).get("port")
+    use_default_org = _env_bool(
+        env_use_default_org, yaml_config.get("hosting_config", {}).get("use_default_org")
+    )
+    allowed_origins = env_allowed_origins or yaml_config.get("hosting_config", {}).get(
+        "allowed_origins"
+    )
+    allowed_regexp = env_allowed_regexp or yaml_config.get("hosting_config", {}).get(
+        "allowed_regexp"
+    )
+    self_hosted = _env_bool(
+        env_self_hosted, yaml_config.get("hosting_config", {}).get("self_hosted")
+    )
+
+    # Tenancy mode — single explicit knob that supersedes the older overlapping
+    # flags (`self_hosted`, `use_default_org`). Two values:
+    #   - "multi":  slug.{LEARNHOUSE_DOMAIN} subdomain detection. Requires EE
+    #               and a configured domain.
+    #   - "single": always serve the default org. Works for localhost dev and
+    #               for self-hosted VPS deployments on any hostname.
+    #
+    # When unset, we infer a default from existing flags so the introduction of
+    # this env var is backward-compatible:
+    #   - EE/SaaS deploys with a real (non-localhost) domain that aren't marked
+    #     self-hosted/dev → "multi" (preserves prior behavior of routing
+    #     `acme.learnhouse.io` to org `acme`).
+    #   - Anything else → "single".
+    # Existing operators upgrading do not need to set LEARNHOUSE_TENANCY for
+    # behavior to stay the same; new operators only need to set it to opt in
+    # to multi tenancy.
+    tenancy_explicit = env_tenancy or yaml_config.get("hosting_config", {}).get("tenancy")
+    if tenancy_explicit:
+        tenancy_raw = tenancy_explicit
+    else:
+        # Inference picks "multi" only when there's a clear signal the
+        # operator intends subdomain-based tenancy. Two signals qualify:
+        #   1. SaaS mode is on (LEARNHOUSE_SAAS=true) — SaaS deployments are
+        #      always multi-tenant by definition.
+        #   2. EE is available AND a shared-subdomain cookie was configured
+        #      (LEARNHOUSE_COOKIE_DOMAIN starts with "."). The dotted cookie
+        #      domain is the strong signal — operators only set it when they
+        #      want subdomains to share auth.
+        # Plain EE on a VPS without a dotted cookie domain falls through to
+        # "single" — which is the right default for the EE-self-host case
+        # (one org on a custom domain, EE features available locally).
+        try:
+            from src.core.ee_hooks import is_ee_available as _is_ee_available
+            _ee_available = _is_ee_available()
+        except Exception:
+            _ee_available = False
+        _dev_for_tenancy = (
+            env_development_mode if env_development_mode is not None
+            else yaml_config.get("general", {}).get("development_mode")
+        )
+        _has_real_domain = bool(domain) and "localhost" not in str(domain).lower()
+        _is_self_or_dev = bool(self_hosted) or bool(_dev_for_tenancy)
+        # `cookies_domain` is computed below; resolve it inline here so the
+        # inference can run before that block.
+        _ck_for_inf = env_cookie_domain or (
+            yaml_config.get("hosting_config", {}).get("cookies_config", {}).get("domain")
+        )
+        _has_shared_cookie_domain = bool(_ck_for_inf) and str(_ck_for_inf).startswith(".")
+        _multi_intent = bool(saas_mode) or (_ee_available and _has_shared_cookie_domain)
+        tenancy_raw = "multi" if (_multi_intent and _has_real_domain and not _is_self_or_dev) else "single"
+
+    tenancy = str(tenancy_raw).strip().lower()
+    if tenancy not in ("multi", "single"):
+        raise ValueError(
+            f"LEARNHOUSE_TENANCY must be 'multi' or 'single' (got {tenancy_raw!r})."
+        )
+
+    cookies_domain = env_cookie_domain or yaml_config.get("hosting_config", {}).get(
+        "cookies_config", {}
+    ).get("domain")
+
+    # Cookie-domain guard: a broad parent like ".example.com" means every
+    # subdomain can read the session cookie. Refuse single-label public
+    # parents outright (e.g. ".com"); warn on any other broad parent unless
+    # the operator opts in with LEARNHOUSE_COOKIE_DOMAIN_ALLOW_BROAD=true.
+    # ".localhost" is exempt — it's an RFC 6761 reserved TLD, not routable.
+    _eff_dev_mode = (
+        env_development_mode
+        if env_development_mode is not None
+        else yaml_config.get("general", {}).get("development_mode")
+    )
+    _TESTING = os.environ.get("TESTING", "").lower() in ("true", "1", "yes")
+    if (
+        not _eff_dev_mode
+        and not _TESTING
+        and cookies_domain
+        and cookies_domain.startswith(".")
+        and cookies_domain.lower() != ".localhost"
+    ):
+        tenant_eTLD = cookies_domain.lstrip(".")
+        allow_broad = os.environ.get(
+            "LEARNHOUSE_COOKIE_DOMAIN_ALLOW_BROAD", ""
+        ).lower() in ("true", "1", "yes")
+        if "." not in tenant_eTLD:
+            raise ValueError(
+                f"SECURITY ERROR: LEARNHOUSE_COOKIE_DOMAIN={cookies_domain!r} is "
+                "too broad (single-label parent). Use a specific domain like "
+                "'.app.example.com'."
+            )
+        if not allow_broad:
+            import logging as _cfg_log
+            _cfg_log.getLogger(__name__).warning(
+                "LEARNHOUSE_COOKIE_DOMAIN is set to the broad parent %r. "
+                "Every subdomain will share the session cookie. If that is "
+                "intentional, set LEARNHOUSE_COOKIE_DOMAIN_ALLOW_BROAD=true to "
+                "silence this warning.",
+                cookies_domain,
+            )
+
+    cookie_config = CookieConfig(domain=cookies_domain)
+
+    frontend_domain = env_frontend_domain or yaml_config.get("hosting_config", {}).get(
+        "frontend_domain", "localhost:3000"
+    )
+
+    env_content_delivery_type = os.environ.get("LEARNHOUSE_CONTENT_DELIVERY_TYPE")
+    content_delivery_type: str = env_content_delivery_type or (
+        (yaml_config.get("hosting_config", {}).get("content_delivery", {}).get("type"))
+        or "filesystem"
+    )  # default to filesystem
+
+    env_bucket_name = os.environ.get("LEARNHOUSE_S3_API_BUCKET_NAME")
+    env_endpoint_url = os.environ.get("LEARNHOUSE_S3_API_ENDPOINT_URL")
+    bucket_name = (
+        yaml_config.get("hosting_config", {})
+        .get("content_delivery", {})
+        .get("s3api", {})
+        .get("bucket_name")
+    ) or env_bucket_name
+    endpoint_url = (
+        yaml_config.get("hosting_config", {})
+        .get("content_delivery", {})
+        .get("s3api", {})
+        .get("endpoint_url")
+    ) or env_endpoint_url
+
+    content_delivery = ContentDeliveryConfig(
+        type=content_delivery_type,  # type: ignore
+        s3api=S3ApiConfig(bucket_name=bucket_name, endpoint_url=endpoint_url),  # type: ignore
+    )
+
+    # Database config
+    sql_connection_string = env_sql_connection_string or yaml_config.get(
+        "database_config", {}
+    ).get("sql_connection_string")
+
+    # AI Config
+    yaml_ai_config = yaml_config.get("ai_config", {}) or {}
+    env_gemini_api_key = os.environ.get("LEARNHOUSE_GEMINI_API_KEY")
+    env_is_ai_enabled_str = os.environ.get("LEARNHOUSE_IS_AI_ENABLED")
+
+    gemini_api_key = env_gemini_api_key or yaml_ai_config.get("gemini_api_key")
+    ai_image_model = os.environ.get("LEARNHOUSE_AI_IMAGE_MODEL") or yaml_ai_config.get("image_model")
+    ai_tts_model = os.environ.get("LEARNHOUSE_AI_TTS_MODEL") or yaml_ai_config.get("tts_model")
+
+    # Provider-agnostic generation settings (env takes precedence over yaml).
+    ai_provider = os.environ.get("LEARNHOUSE_AI_PROVIDER") or yaml_ai_config.get("provider")
+    ai_api_key = os.environ.get("LEARNHOUSE_AI_API_KEY") or yaml_ai_config.get("api_key")
+    ai_base_url = os.environ.get("LEARNHOUSE_AI_BASE_URL") or yaml_ai_config.get("base_url")
+    ai_model_fast = os.environ.get("LEARNHOUSE_AI_MODEL_FAST") or yaml_ai_config.get("model_fast")
+    ai_model_standard = os.environ.get("LEARNHOUSE_AI_MODEL_STANDARD") or yaml_ai_config.get("model_standard")
+    ai_model_pro = os.environ.get("LEARNHOUSE_AI_MODEL_PRO") or yaml_ai_config.get("model_pro")
+    ai_embedding_provider = os.environ.get("LEARNHOUSE_AI_EMBEDDING_PROVIDER") or yaml_ai_config.get("embedding_provider")
+    ai_embedding_model = os.environ.get("LEARNHOUSE_AI_EMBEDDING_MODEL") or yaml_ai_config.get("embedding_model")
+    _ai_embedding_dims = os.environ.get("LEARNHOUSE_AI_EMBEDDING_DIMENSIONS") or yaml_ai_config.get("embedding_dimensions")
+    ai_embedding_dimensions = int(_ai_embedding_dims) if _ai_embedding_dims else None
+
+    # Parse is_ai_enabled from env or yaml
+    if env_is_ai_enabled_str:
+        is_ai_enabled = env_is_ai_enabled_str.lower() in ("true", "1", "yes")
+    else:
+        is_ai_enabled = yaml_ai_config.get("is_ai_enabled", False)
+
+    # Redis config
+    env_redis_connection_string = os.environ.get("LEARNHOUSE_REDIS_CONNECTION_STRING")
+    redis_connection_string = env_redis_connection_string or yaml_config.get(
+        "redis_config", {}
+    ).get("redis_connection_string")
+
+    # Mailing config
+    env_email_provider = os.environ.get("LEARNHOUSE_EMAIL_PROVIDER")
+    env_resend_api_key = os.environ.get("LEARNHOUSE_RESEND_API_KEY")
+    env_system_email_address = os.environ.get("LEARNHOUSE_SYSTEM_EMAIL_ADDRESS")
+    env_system_email_sender_name = os.environ.get("LEARNHOUSE_SYSTEM_EMAIL_SENDER_NAME")
+    env_smtp_host = os.environ.get("LEARNHOUSE_SMTP_HOST")
+    env_smtp_port = os.environ.get("LEARNHOUSE_SMTP_PORT")
+    env_smtp_username = os.environ.get("LEARNHOUSE_SMTP_USERNAME")
+    env_smtp_password = os.environ.get("LEARNHOUSE_SMTP_PASSWORD")
+    env_smtp_use_tls = os.environ.get("LEARNHOUSE_SMTP_USE_TLS")
+
+    email_provider = env_email_provider or yaml_config.get("mailing_config", {}).get(
+        "email_provider", "resend"
+    )
+    resend_api_key = env_resend_api_key or yaml_config.get("mailing_config", {}).get(
+        "resend_api_key"
+    )
+    system_email_address = env_system_email_address or yaml_config.get(
+        "mailing_config", {}
+    ).get("system_email_address")
+    # Defaults to "LearnHouse" so an unset deployment keeps the historical
+    # From name exactly as it was.
+    system_email_sender_name = env_system_email_sender_name or yaml_config.get(
+        "mailing_config", {}
+    ).get("system_email_sender_name", "LearnHouse")
+    smtp_host = env_smtp_host or yaml_config.get("mailing_config", {}).get("smtp_host")
+    smtp_port = int(env_smtp_port) if env_smtp_port else yaml_config.get("mailing_config", {}).get("smtp_port", 587)
+    smtp_username = env_smtp_username or yaml_config.get("mailing_config", {}).get("smtp_username")
+    smtp_password = env_smtp_password or yaml_config.get("mailing_config", {}).get("smtp_password")
+    smtp_use_tls = (
+        env_smtp_use_tls.lower() in ("true", "1", "yes") if env_smtp_use_tls
+        else yaml_config.get("mailing_config", {}).get("smtp_use_tls", True)
+    )
+
+    # Tinybird config — auto-enabled when API URL is set
+    env_tinybird_api_url = os.environ.get("LEARNHOUSE_TINYBIRD_API_URL")
+    env_tinybird_ingest_token = os.environ.get("LEARNHOUSE_TINYBIRD_INGEST_TOKEN")
+    env_tinybird_read_token = os.environ.get("LEARNHOUSE_TINYBIRD_READ_TOKEN")
+
+    tinybird_api_url = env_tinybird_api_url or yaml_config.get("tinybird_config", {}).get("api_url", "")
+    tinybird_ingest_token = env_tinybird_ingest_token or yaml_config.get("tinybird_config", {}).get("ingest_token", "")
+    tinybird_read_token = env_tinybird_read_token or yaml_config.get("tinybird_config", {}).get("read_token", "")
+
+    tinybird_config = None
+    if tinybird_api_url:
+        tinybird_config = TinybirdConfig(
+            api_url=tinybird_api_url.rstrip("/"),
+            ingest_token=tinybird_ingest_token,
+            read_token=tinybird_read_token,
+        )
+
+    # Judge0 config — auto-enabled when API URL is set
+    env_judge0_api_url = os.environ.get("LEARNHOUSE_JUDGE0_API_URL")
+    env_judge0_client_id = os.environ.get("LEARNHOUSE_JUDGE0_CLIENT_ID")
+    env_judge0_client_secret = os.environ.get("LEARNHOUSE_JUDGE0_CLIENT_SECRET")
+
+    judge0_api_url = env_judge0_api_url or yaml_config.get("judge0_config", {}).get("api_url", "")
+    judge0_client_id = env_judge0_client_id or yaml_config.get("judge0_config", {}).get("client_id")
+    judge0_client_secret = env_judge0_client_secret or yaml_config.get("judge0_config", {}).get("client_secret")
+
+    judge0_config = None
+    if judge0_api_url:
+        judge0_config = Judge0Config(
+            api_url=judge0_api_url.rstrip("/"),
+            client_id=judge0_client_id,
+            client_secret=judge0_client_secret,
+        )
+
+    # Payments config
+    env_stripe_secret_key = os.environ.get("LEARNHOUSE_STRIPE_SECRET_KEY")
+    env_stripe_publishable_key = os.environ.get("LEARNHOUSE_STRIPE_PUBLISHABLE_KEY")
+    env_stripe_webhook_standard_secret = os.environ.get("LEARNHOUSE_STRIPE_WEBHOOK_STANDARD_SECRET")
+    env_stripe_webhook_connect_secret = os.environ.get("LEARNHOUSE_STRIPE_WEBHOOK_CONNECT_SECRET")
+    env_stripe_client_id = os.environ.get("LEARNHOUSE_STRIPE_CLIENT_ID")
+    
+    stripe_secret_key = env_stripe_secret_key or yaml_config.get("payments_config", {}).get(
+        "stripe", {}
+    ).get("stripe_secret_key")
+    
+    stripe_publishable_key = env_stripe_publishable_key or yaml_config.get("payments_config", {}).get(
+        "stripe", {}
+    ).get("stripe_publishable_key")
+
+    stripe_webhook_standard_secret = env_stripe_webhook_standard_secret or yaml_config.get("payments_config", {}).get(
+        "stripe", {}
+    ).get("stripe_webhook_standard_secret")
+
+    stripe_webhook_connect_secret = env_stripe_webhook_connect_secret or yaml_config.get("payments_config", {}).get(
+        "stripe", {}
+    ).get("stripe_webhook_connect_secret")
+
+    stripe_client_id = env_stripe_client_id or yaml_config.get("payments_config", {}).get(
+        "stripe", {}
+    ).get("stripe_client_id")
+
+    # Create HostingConfig and DatabaseConfig objects
+    hosting_config = HostingConfig(
+        tenancy=tenancy,
+        domain=domain,
+        frontend_domain=frontend_domain,
+        ssl=bool(ssl),
+        port=int(port),
+        use_default_org=bool(use_default_org),
+        allowed_origins=list(allowed_origins),
+        allowed_regexp=allowed_regexp,
+        self_hosted=bool(self_hosted),
+        cookie_config=cookie_config,
+        content_delivery=content_delivery,
+    )
+
+    # Tenancy validation and deprecation warnings — only enforce in non-test
+    # contexts so unit tests can construct configs with arbitrary values.
+    _TESTING_TENANCY = os.environ.get("TESTING", "").lower() in ("true", "1", "yes")
+    if not _TESTING_TENANCY:
+        import logging as _t_log
+        _t_logger = _t_log.getLogger(__name__)
+
+        if tenancy == "multi":
+            # Multi mode requires EE (or SaaS, which implies EE features) and
+            # an explicit base domain. Localhost is not a routable subdomain
+            # parent for browsers in production, so `LEARNHOUSE_DOMAIN=localhost`
+            # is rejected here.
+            try:
+                from src.core.ee_hooks import is_ee_available
+                ee_available = is_ee_available()
+            except Exception:
+                ee_available = False
+            if not (ee_available or saas_mode):
+                raise ValueError(
+                    "LEARNHOUSE_TENANCY=multi requires the Enterprise Edition "
+                    "or LEARNHOUSE_SAAS=true. Either install the `ee/` folder, "
+                    "unset LEARNHOUSE_DISABLE_EE, or use LEARNHOUSE_TENANCY=single."
+                )
+            if not domain or "localhost" in str(domain).lower():
+                raise ValueError(
+                    "LEARNHOUSE_TENANCY=multi requires LEARNHOUSE_DOMAIN to be set "
+                    "to a routable parent domain (e.g. 'learnhouse.io'). "
+                    f"Got domain={domain!r}."
+                )
+
+        if tenancy == "single":
+            # In single mode the cookie domain is always host-only — operators
+            # who set LEARNHOUSE_COOKIE_DOMAIN expecting cross-subdomain auth
+            # will be surprised. Warn loudly.
+            if env_cookie_domain:
+                _t_logger.warning(
+                    "LEARNHOUSE_COOKIE_DOMAIN=%r is set but LEARNHOUSE_TENANCY=single "
+                    "ignores it (cookies are host-only in single mode).",
+                    env_cookie_domain,
+                )
+
+        # Deprecations: both flags are subsumed by LEARNHOUSE_TENANCY.
+        if env_use_default_org is not None:
+            _t_logger.warning(
+                "LEARNHOUSE_USE_DEFAULT_ORG is deprecated; tenancy mode "
+                "(LEARNHOUSE_TENANCY=%s) now controls default-org behavior.",
+                tenancy,
+            )
+        if env_self_hosted is not None:
+            _t_logger.warning(
+                "LEARNHOUSE_SELF_HOSTED is deprecated; use LEARNHOUSE_TENANCY=single "
+                "instead (currently tenancy=%s).",
+                tenancy,
+            )
+    database_config = DatabaseConfig(
+        sql_connection_string=sql_connection_string,
+    )
+
+    # AI Config
+    ai_config = AIConfig(
+        is_ai_enabled=bool(is_ai_enabled),
+        provider=ai_provider,
+        api_key=ai_api_key,
+        base_url=ai_base_url,
+        model_fast=ai_model_fast,
+        model_standard=ai_model_standard,
+        model_pro=ai_model_pro,
+        embedding_provider=ai_embedding_provider,
+        embedding_model=ai_embedding_model,
+        embedding_dimensions=ai_embedding_dimensions,
+        gemini_api_key=gemini_api_key,
+        image_model=ai_image_model,
+        tts_model=ai_tts_model,
+    )
+
+    # Surface missing internal-service keys at boot rather than at first
+    # request — the per-endpoint handlers fail closed either way, but a
+    # 403 from a cron job is harder to diagnose than a startup log line.
+    #
+    # These keys are SaaS-only — they secure RPC calls from the platform
+    # control plane (custom domains, plans, internal cron) to the per-tenant
+    # backend. Self-hosted EE / OSS deployments don't run that control plane
+    # and don't need them, so suppress the warning in those modes.
+    # Reported ONCE per process, as a single aggregated line. This block used to
+    # warn on every config load, which emitted the same two lines thousands of
+    # times a day and buried the one-shot warnings around them — a disabled
+    # Google audience check sat unnoticed in that noise. One loud line per
+    # process is what actually gets read.
+    global _LOGGED_MISSING_INTERNAL_KEYS
+    if not development_mode and saas_mode and not _LOGGED_MISSING_INTERNAL_KEYS:
+        _LOGGED_MISSING_INTERNAL_KEYS = True
+        import logging as _cfg_log
+        _log = _cfg_log.getLogger(__name__)
+
+        missing = []
+        if not os.environ.get("CLOUD_INTERNAL_KEY"):
+            missing.append(
+                "CLOUD_INTERNAL_KEY (custom domain sync, cloud_internal plan writes)"
+            )
+        if not os.environ.get("LEARNHOUSE_PLATFORM_API_KEY"):
+            missing.append(
+                "LEARNHOUSE_PLATFORM_API_KEY (pack activation, active-user overage billing)"
+            )
+        if not (
+            os.environ.get("LEARNHOUSE_GOOGLE_OAUTH_CLIENT_ID")
+            or os.environ.get("LEARNHOUSE_GOOGLE_CLIENT_ID")
+        ):
+            missing.append(
+                "LEARNHOUSE_GOOGLE_OAUTH_CLIENT_ID (Google OAuth audience "
+                "verification — absent means it is DISABLED, not merely unset)"
+            )
+        if missing:
+            _log.critical(
+                "SaaS deployment is missing %d required credential(s); the "
+                "features behind them fail silently until these are set: %s",
+                len(missing),
+                "; ".join(missing),
+            )
+
+    # Create LearnHouseConfig object
+    config = LearnHouseConfig(
+        site_name=site_name,
+        site_description=site_description,
+        contact_email=contact_email,
+        general_config=GeneralConfig(
+            development_mode=bool(development_mode),
+            sentry_config=SentryConfig(dsn=sentry_dsn),
+            saas_mode=bool(saas_mode),
+            env=learnhouse_env,
+        ),
+        hosting_config=hosting_config,
+        database_config=database_config,
+        security_config=SecurityConfig(auth_jwt_secret_key=auth_jwt_secret_key),
+        ai_config=ai_config,
+        redis_config=RedisConfig(redis_connection_string=redis_connection_string),
+        mailing_config=MailingConfig(
+            email_provider=email_provider,
+            system_email_address=system_email_address,
+            system_email_sender_name=system_email_sender_name,
+            resend_api_key=resend_api_key,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            smtp_username=smtp_username,
+            smtp_password=smtp_password,
+            smtp_use_tls=smtp_use_tls,
+        ),
+        payments_config=InternalPaymentsConfig(
+            stripe=InternalStripeConfig(
+                stripe_secret_key=stripe_secret_key,
+                stripe_publishable_key=stripe_publishable_key,
+                stripe_webhook_standard_secret=stripe_webhook_standard_secret,
+                stripe_webhook_connect_secret=stripe_webhook_connect_secret,
+                stripe_client_id=stripe_client_id
+            )
+        ),
+        tinybird_config=tinybird_config,
+        judge0_config=judge0_config,
+    )
+
+    return config

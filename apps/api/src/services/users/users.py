@@ -1,0 +1,1046 @@
+import json
+import logging
+import os
+from datetime import datetime, timezone
+from typing import Literal
+from uuid import uuid4
+from fastapi import HTTPException, Request, UploadFile, status
+import redis
+from sqlmodel import select, func
+from sqlmodel.ext.asyncio.session import AsyncSession
+from config.config import get_learnhouse_config
+from src.security.features_utils.usage import (
+    check_limits_with_usage,
+    increase_feature_usage,
+)
+from src.core.deployment_mode import get_deployment_mode
+from src.services.users.usergroups import add_users_to_usergroup
+from src.services.users.emails import (
+    send_account_creation_email,
+)
+from src.services.orgs.invites import get_invite_code
+from src.services.users.avatars import upload_avatar
+from src.db.roles import Role, RoleRead
+from src.security.rbac.rbac import (
+    authorization_verify_based_on_roles_and_authorship,
+    authorization_verify_if_user_is_anon,
+)
+from src.db.organization_config import OrganizationConfig
+from src.db.organizations import Organization, OrganizationRead
+from src.services.orgs.orgs import get_org_default_language, resolve_org_sender_name
+from src.db.users import (
+    AnonymousUser,
+    InternalUser,
+    PublicUser,
+    User,
+    UserCreate,
+    UserRead,
+    UserReadPublic,
+    UserRoleWithOrg,
+    UserSession,
+    UserUpdate,
+    UserUpdatePassword,
+)
+from src.db.user_organizations import UserOrganization
+from src.security.rbac.constants import ADMIN_ROLE_ID
+from src.security.security import security_hash_password, security_verify_password
+from src.services.security.password_validation import validate_password_complexity
+from src.services.security.profile_validation import validate_profile_fields
+from src.services.analytics.analytics import track
+from src.services.analytics import events as analytics_events
+from src.services.webhooks.dispatch import dispatch_webhooks
+
+
+def _reject_urls_in_profile_fields(**fields) -> None:
+    """Reject display-name fields containing URLs/links (S: phishing relay).
+
+    Raises HTTP 400 ``PROFILE_FIELD_INVALID`` if any of ``username``,
+    ``first_name`` or ``last_name`` contains a link. ``None`` values are
+    skipped so this is safe for partial updates.
+    """
+    result = validate_profile_fields(fields)
+    if not result.is_valid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "PROFILE_FIELD_INVALID",
+                "message": "Display name fields may not contain URLs or links",
+                "errors": result.errors,
+                "invalid_fields": result.invalid_fields,
+            },
+        )
+
+
+async def _resolve_signup_custom_fields(
+    user_object: UserCreate,
+    org_id: int,
+    db_session: AsyncSession,
+    enforce_required: bool = True,
+) -> dict | None:
+    """Build the ``extra_metadata`` value for a public signup.
+
+    Only keys the org declared as signup fields survive; the submitted
+    ``extra_metadata`` blob is ignored entirely. Returns ``None`` when the org
+    declares no fields, so users keep a null column instead of an empty dict.
+
+    ``enforce_required`` is False for OAuth, which has no form to fill in.
+    """
+    from src.services.orgs.signup_fields import (
+        get_signup_fields,
+        validate_signup_field_values,
+    )
+
+    org_config = await _get_org_config_for_signup(org_id, db_session)
+    fields = get_signup_fields(org_config)
+    if not fields:
+        return None
+
+    values = validate_signup_field_values(
+        fields, user_object.custom_fields, enforce_required=enforce_required
+    )
+    return values or None
+
+
+async def _get_org_config_for_signup(
+    org_id: int, db_session: AsyncSession
+) -> dict | None:
+    from src.db.organization_config import OrganizationConfig
+
+    statement = select(OrganizationConfig).where(OrganizationConfig.org_id == org_id)
+    org_config = (await db_session.execute(statement)).scalars().first()
+    return org_config.config if org_config else None
+
+
+async def _get_welcome_cta_url(
+    request: Request,
+    db_session: AsyncSession,
+    org_id: int | None,
+) -> str | None:
+    """Where the welcome email's "Get Started" button should land.
+
+    - Account created inside an org → that org's own home, on the org's host
+      (verified custom domain when it has one). Mirrors the verification and
+      invite emails so the user stays on the host their session lives on.
+    - Org-less signup → the platform's organizations list, so the user picks
+      or creates an org rather than landing somewhere with no org context.
+
+    Returns None if no URL can be resolved, letting the caller fall back.
+    """
+    from src.services.email.utils import (
+        get_base_url_from_request,
+        get_org_signup_base_url,
+        get_trusted_base_url_from_request,
+    )
+
+    try:
+        if org_id is not None:
+            org_stmt = select(Organization).where(Organization.id == org_id)
+            org = (await db_session.execute(org_stmt)).scalars().first()
+            if org is not None:
+                base_url = await get_org_signup_base_url(
+                    org.slug, request, db_session=db_session, org_id=org_id
+                )
+                # The org's own landing page, NOT `/home`: `/home` is the
+                # platform org picker on every host, so an org-scoped
+                # `{org-host}/home` bounces the user to "Your Organizations"
+                # instead of the academy the email is about.
+                return base_url.rstrip("/") or "/"
+            return None
+
+        # Org-less signups often arrive without a trusted Origin/Referer, and the
+        # generic request fallback would land on the org app rather than the
+        # platform — so only use it after the explicit platform URL.
+        base_url = get_trusted_base_url_from_request(request)
+        if not base_url:
+            platform_url = os.environ.get("LEARNHOUSE_PLATFORM_URL")
+            base_url = (
+                platform_url.rstrip("/")
+                if platform_url
+                else get_base_url_from_request(request)
+            )
+        return f"{base_url.rstrip('/')}/organizations"
+    except Exception:
+        # A welcome email with a fallback link beats no welcome email.
+        logging.getLogger(__name__).warning(
+            "Could not resolve welcome email CTA URL", exc_info=True
+        )
+        return None
+
+
+async def create_user(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+    user_object: UserCreate,
+    org_id: int,
+    is_oauth: bool = False,
+    signup_provider: str = "email",
+):
+    # Validate password complexity (skip for OAuth users who have empty passwords)
+    if user_object.password and not is_oauth:
+        validation_result = validate_password_complexity(user_object.password)
+        if not validation_result.is_valid:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "WEAK_PASSWORD",
+                    "message": "Password does not meet security requirements",
+                    "errors": validation_result.errors,
+                    "requirements": validation_result.requirements,
+                },
+            )
+
+    # Reject phishing links in display-name fields at signup.
+    _reject_urls_in_profile_fields(
+        username=user_object.username,
+        first_name=user_object.first_name,
+        last_name=user_object.last_name,
+    )
+
+    user = User.model_validate(user_object)
+
+    # RBAC check
+    await rbac_check(request, current_user, "create", "user_x", db_session)
+
+    # Complete the user object
+    user.user_uuid = f"user_{uuid4()}"
+    user.password = security_hash_password(user_object.password) if user_object.password else ""
+
+    # OAuth users and OSS mode get auto-verified email
+    if is_oauth or get_deployment_mode() != 'saas':
+        user.email_verified = True
+        user.email_verified_at = datetime.now(timezone.utc).isoformat()
+        user.signup_method = signup_provider if is_oauth else "email"
+    else:
+        user.email_verified = False
+        user.email_verified_at = None
+        user.signup_method = "email"
+
+    user.creation_date = str(datetime.now())
+    user.update_date = str(datetime.now())
+
+    # Verifications
+
+    # Check if Organization exists
+    statement = select(Organization).where(Organization.id == org_id)
+    result = (await db_session.execute(statement)).scalars().first()
+
+    if not result:
+        raise HTTPException(
+            status_code=400,
+            detail="Organization does not exist",
+        )
+
+    # SECURITY: signup is public, so the submitted extra_metadata blob is never
+    # trusted. Discard it and rebuild the dict from the org's declared signup
+    # fields alone. Raises 400 when a required field is missing or invalid.
+    #
+    # OAuth never sees the signup form, so required fields cannot be enforced
+    # here — that would make an org with a required field unable to use Google
+    # sign-in at all. Those users are asked to complete their profile after
+    # landing instead (see the signup-fields completion endpoint).
+    user.extra_metadata = await _resolve_signup_custom_fields(
+        user_object, org_id, db_session, enforce_required=not is_oauth
+    )
+
+    # Usage check
+    await check_limits_with_usage("members", org_id, db_session)
+
+    # SECURITY: single generic error for both email and username conflicts so
+    # the endpoint cannot be used to probe which addresses or handles are
+    # already registered (account enumeration).
+    conflict = (await db_session.execute(
+        select(User).where(
+            (User.username == user.username) | (User.email == user.email)
+        )
+    )).scalars().first()
+
+    if conflict:
+        raise HTTPException(
+            status_code=400,
+            detail="Email or username is already in use",
+        )
+
+    # Exclude unset values; strip protected fields to prevent privilege escalation.
+    # `extra_metadata` is protected here because it was just rebuilt from the
+    # org's declared signup fields — re-applying the submitted value would undo
+    # that and let a public caller store arbitrary JSON.
+    _PROTECTED_FIELDS = {"is_superadmin", "id", "user_uuid", "extra_metadata"}
+    user_data = user.model_dump(exclude_unset=True)
+    for key, value in user_data.items():
+        if key not in _PROTECTED_FIELDS:
+            setattr(user, key, value)
+
+    # Add user to database
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    # Link user and organization
+    user_organization = UserOrganization(
+        user_id=user.id if user.id else 0,
+        org_id=org_id,
+        role_id=4,
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
+    )
+
+    db_session.add(user_organization)
+    await db_session.commit()
+    await db_session.refresh(user_organization)
+
+    user_read = UserRead.model_validate(user)
+
+    await increase_feature_usage("members", org_id, db_session)
+
+    # Track user signup
+    await track(
+        event_name=analytics_events.USER_SIGNED_UP,
+        org_id=org_id,
+        user_id=user.id if user.id else 0,
+        properties={"signup_method": signup_provider},
+    )
+    await dispatch_webhooks(
+        event_name=analytics_events.USER_SIGNED_UP,
+        org_id=org_id,
+        data={
+            "user": {
+                "user_uuid": user.user_uuid,
+                "email": user.email,
+                "username": user.username,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+            },
+            "signup_method": signup_provider,
+        },
+    )
+
+    # Send verification email for non-OAuth users, account creation email for OAuth users
+    if is_oauth:
+        org_config_stmt = select(OrganizationConfig).where(OrganizationConfig.org_id == org_id)
+        org_config = (await db_session.execute(org_config_stmt)).scalars().first()
+        # White-label the welcome email to the org: name it in the subject/body
+        # and use the org's own logo when it has one.
+        from src.services.email.utils import get_org_logo_url
+        org_stmt = select(Organization).where(Organization.id == org_id)
+        org = (await db_session.execute(org_stmt)).scalars().first()
+        send_account_creation_email(
+            user=user_read,
+            email=user_read.email,
+            lang=get_org_default_language(org_config),
+            cta_url=await _get_welcome_cta_url(request, db_session, org_id),
+            org_name=org.name if org else None,
+            logo_url=get_org_logo_url(org, request) if org else None,
+            sender_name=resolve_org_sender_name(org_config),
+        )
+    elif get_deployment_mode() == 'saas':
+        # Import here to avoid circular imports
+        from src.services.users.email_verification import send_verification_email
+        await send_verification_email(request, db_session, user, org_id)
+
+    return user_read
+
+
+async def create_user_with_invite(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+    user_object: UserCreate,
+    org_id: int,
+    invite_code: str,
+):
+
+    # Check if invite code exists
+    inviteCode = await get_invite_code(
+        request, org_id, invite_code, current_user, db_session
+    )
+
+    if not inviteCode:
+        raise HTTPException(
+            status_code=400,
+            detail="Invite code is incorrect",
+        )
+
+    # Usage check
+    await check_limits_with_usage("members", org_id, db_session)
+
+
+
+    user = await create_user(request, db_session, current_user, user_object, org_id, signup_provider="invite")
+
+    # Check if invite code contains UserGroup
+    if inviteCode.get("usergroup_id"): # type: ignore
+        # Add user to UserGroup
+        await add_users_to_usergroup(
+            request,
+            db_session,
+            InternalUser(id=0),
+            int(inviteCode.get("usergroup_id")), # type: ignore / Convert to int since usergroup_id is expected to be int
+            str(user.id),
+        )
+
+    # NOTE: members usage is already incremented inside create_user(); do not
+    # increment again here or every invited signup double-counts the member quota.
+
+    # Mark the invitation as no longer pending in Redis
+    try:
+        LH_CONFIG = get_learnhouse_config()
+        redis_conn_string = LH_CONFIG.redis_config.redis_connection_string
+        if redis_conn_string:
+            r = redis.Redis.from_url(redis_conn_string)
+            statement = select(Organization).where(Organization.id == org_id)
+            org = (await db_session.execute(statement)).scalars().first()
+            if org:
+                # Invites are keyed on the lower-cased address; without
+                # normalising here a signup that typed the address with
+                # different capitals left the invitation showing as "Pending"
+                # forever even though the person had joined.
+                redis_key = (
+                    f"invited_user:{user_object.email.strip().lower()}"
+                    f":org:{org.org_uuid}"
+                )
+                invited_data = r.get(redis_key)
+                if invited_data:
+                    invited_record = json.loads(invited_data)
+                    invited_record["pending"] = False
+                    remaining_ttl = r.ttl(redis_key)
+                    r.set(
+                        redis_key,
+                        json.dumps(invited_record),
+                        ex=remaining_ttl if remaining_ttl > 0 else None,
+                    )
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Failed to update invitation pending status for %s",
+            user_object.email,
+        )
+
+    return user
+
+
+async def create_user_without_org(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+    user_object: UserCreate,
+    is_oauth: bool = False,
+    signup_provider: str = "email",
+):
+    # Validate password complexity (skip for OAuth users who have empty passwords)
+    if user_object.password and not is_oauth:
+        validation_result = validate_password_complexity(user_object.password)
+        if not validation_result.is_valid:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "code": "WEAK_PASSWORD",
+                    "message": "Password does not meet security requirements",
+                    "errors": validation_result.errors,
+                    "requirements": validation_result.requirements,
+                },
+            )
+
+    # Reject phishing links in display-name fields at signup.
+    _reject_urls_in_profile_fields(
+        username=user_object.username,
+        first_name=user_object.first_name,
+        last_name=user_object.last_name,
+    )
+
+    user = User.model_validate(user_object)
+
+    # RBAC check
+    await rbac_check(request, current_user, "create", "user_x", db_session)
+
+    # Complete the user object
+    user.user_uuid = f"user_{uuid4()}"
+    user.password = security_hash_password(user_object.password) if user_object.password else ""
+
+    # OAuth users and OSS mode get auto-verified email
+    if is_oauth or get_deployment_mode() != 'saas':
+        user.email_verified = True
+        user.email_verified_at = datetime.now(timezone.utc).isoformat()
+        user.signup_method = signup_provider if is_oauth else "email"
+    else:
+        user.email_verified = False
+        user.email_verified_at = None
+        user.signup_method = "email"
+
+    user.creation_date = str(datetime.now())
+    user.update_date = str(datetime.now())
+
+    # SECURITY: this endpoint is public and has no org, so there are no declared
+    # signup fields to validate against — nothing may be stored. Dropping the
+    # submitted blob stops an anonymous caller writing arbitrary JSON.
+    user.extra_metadata = None
+
+    # Verifications
+
+    # SECURITY: single generic error for both email and username conflicts to
+    # prevent account enumeration via this org-less signup endpoint.
+    conflict = (await db_session.execute(
+        select(User).where(
+            (User.username == user.username) | (User.email == user.email)
+        )
+    )).scalars().first()
+
+    if conflict:
+        raise HTTPException(
+            status_code=400,
+            detail="Email or username is already in use",
+        )
+
+    # Exclude unset values; strip protected fields to prevent privilege escalation.
+    # `extra_metadata` is protected because this org-less path has no declared
+    # signup fields, so a submitted blob must never reach the database.
+    _PROTECTED_FIELDS = {"is_superadmin", "id", "user_uuid", "extra_metadata"}
+    user_data = user.model_dump(exclude_unset=True)
+    for key, value in user_data.items():
+        if key not in _PROTECTED_FIELDS:
+            setattr(user, key, value)
+
+    # Add user to database
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    user_read = UserRead.model_validate(user)
+
+    # OAuth users get welcome email (already verified)
+    # Non-OAuth SaaS users get verification email (no org needed)
+    if is_oauth or get_deployment_mode() != 'saas':
+        send_account_creation_email(
+            user=user_read,
+            email=user_read.email,
+            cta_url=await _get_welcome_cta_url(request, db_session, org_id=None),
+        )
+    else:
+        from src.services.users.email_verification import send_verification_email
+        await send_verification_email(request, db_session, user, org_id=None)
+
+    return user_read
+
+
+async def update_user(
+    request: Request,
+    db_session: AsyncSession,
+    user_id: int,
+    current_user: PublicUser | AnonymousUser,
+    user_object: UserUpdate,
+):
+    # Get user
+    statement = select(User).where(User.id == user_id)
+    user = (await db_session.execute(statement)).scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=400,
+            detail="User does not exist",
+        )
+
+    # RBAC check
+    await rbac_check(request, current_user, "update", user.user_uuid, db_session)
+
+    # Reject phishing links in display-name fields on profile update.
+    _reject_urls_in_profile_fields(
+        username=user_object.username,
+        first_name=user_object.first_name,
+        last_name=user_object.last_name,
+    )
+
+    # Verifications
+
+    # SECURITY: merge email/username conflict errors into one generic message
+    # so an authenticated attacker cannot iterate candidate usernames/emails
+    # via the update endpoint to enumerate other accounts.
+    conflict = (await db_session.execute(
+        select(User).where(
+            ((User.username == user_object.username) | (User.email == user_object.email))
+            & (User.id != user.id)
+        )
+    )).scalars().first()
+
+    if conflict:
+        raise HTTPException(
+            status_code=400,
+            detail="Email or username is already in use",
+        )
+
+    # Update user; strip protected fields to prevent privilege escalation.
+    # email_verified is also protected so changing the email cannot leave
+    # the account appearing "already verified" on the new address.
+    # extra_metadata is protected because it holds the answers to the org's
+    # signup fields: letting a member rewrite it through their own profile
+    # would let them forge data the organization collected about them.
+    _PROTECTED_FIELDS = {
+        "is_superadmin",
+        "id",
+        "user_uuid",
+        "email_verified",
+        "email_verified_at",
+        "extra_metadata",
+    }
+    user_data = user_object.model_dump(exclude_unset=True)
+
+    # SECURITY: if the email actually changed, force re-verification on the
+    # new address. SaaS login requires email_verified=True, so this prevents
+    # a compromised session from pivoting to an attacker-controlled address
+    # while keeping the trusted-since-signup flag set.
+    incoming_email = user_data.get("email")
+    if incoming_email is not None and incoming_email != user.email:
+        user.email_verified = False
+        user.email_verified_at = None
+
+    for key, value in user_data.items():
+        if key not in _PROTECTED_FIELDS:
+            setattr(user, key, value)
+
+    user.update_date = str(datetime.now())
+
+    # Update user in database
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    user = UserRead.model_validate(user)
+
+    return user
+
+
+async def update_user_avatar(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+    avatar_file: UploadFile | None = None,
+):
+    # Get user
+    statement = select(User).where(User.id == current_user.id)
+    user = (await db_session.execute(statement)).scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=400,
+            detail="User does not exist",
+        )
+
+    # RBAC check
+    await rbac_check(request, current_user, "update", user.user_uuid, db_session)
+
+    # Upload avatar with security validation
+    if avatar_file and avatar_file.filename:
+        try:
+            name_in_disk = await upload_avatar(avatar_file, user.user_uuid)
+            user.avatar_image = name_in_disk
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Avatar upload failed: {str(e)}",
+            )
+
+    # Update user in database
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    user = UserRead.model_validate(user)
+
+    return user
+
+
+async def update_user_password(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+    user_id: int,
+    form: UserUpdatePassword,
+):
+    """
+    Update user password.
+
+    SECURITY: Users can only change their own password. This function:
+    1. Validates that user_id matches current_user.id (IDOR protection)
+    2. Verifies the old password before allowing change
+    3. Validates password complexity requirements
+    """
+
+    # Users can ONLY change their own password
+    if current_user.id != user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You can only change your own password",
+        )
+
+    # Validate new password complexity
+    validation_result = validate_password_complexity(form.new_password)
+    if not validation_result.is_valid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "WEAK_PASSWORD",
+                "message": "Password does not meet security requirements",
+                "errors": validation_result.errors,
+                "requirements": validation_result.requirements,
+            },
+        )
+
+    # Get user (we already verified it's the current user)
+    statement = select(User).where(User.id == user_id)
+    user = (await db_session.execute(statement)).scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=400,
+            detail="User does not exist",
+        )
+
+    # Verify old password before allowing change. Accounts with no local
+    # password (Google/SSO signups, admin-provisioned users) store an empty
+    # sentinel that pwdlib rejects with UnknownHashError, which surfaced as a 500
+    # instead of an answer — there is no old password to prove here, so refuse it
+    # the same way a wrong one is refused.
+    if not user.password or not security_verify_password(form.old_password, user.password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Wrong password"
+        )
+
+    # Update user
+    user.password = security_hash_password(form.new_password)
+    # SECURITY: stamp the change so every token minted before it is rejected by
+    # get_current_user and /auth/refresh. Without this, a session stolen before
+    # the password change survives it for the full refresh-token lifetime — the
+    # reset-code flow already stamps it, this one did not.
+    user.password_changed_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    user.update_date = str(datetime.now())
+
+    # Update user in database
+    db_session.add(user)
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    # Belt-and-braces: also push the Redis revocation cutoff so tokens without
+    # an ``iat`` (pre-upgrade) die too. Never block the password change on it.
+    if user.id is not None:
+        try:
+            # Imported here: src.security.auth imports this module, so a
+            # top-level import would be circular.
+            from src.security.auth import revoke_user_sessions_before
+
+            revoke_user_sessions_before(user.id)
+        except Exception:
+            pass
+
+    user = UserRead.model_validate(user)
+
+    return user
+
+
+async def read_user_by_id(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+    user_id: int,
+):
+    """
+    Get user by ID.
+
+    SECURITY: Returns 404 with generic message to prevent user enumeration.
+    Returns UserReadPublic to exclude sensitive fields (is_superadmin, signup_method).
+    """
+    # Get user
+    statement = select(User).where(User.id == user_id)
+    user = (await db_session.execute(statement)).scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="Resource not found",  # Generic message prevents enumeration
+        )
+
+    return UserReadPublic.model_validate(user)
+
+
+async def read_user_by_uuid(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+    user_uuid: str,
+):
+    """
+    Get user by UUID.
+
+    SECURITY: Returns 404 with generic message to prevent user enumeration.
+    Returns UserReadPublic to exclude sensitive fields (is_superadmin, signup_method).
+    """
+    # Get user
+    statement = select(User).where(User.user_uuid == user_uuid)
+    user = (await db_session.execute(statement)).scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="Resource not found",  # Generic message prevents enumeration
+        )
+
+    return UserReadPublic.model_validate(user)
+
+
+async def read_user_by_username(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+    username: str,
+):
+    """
+    Get user by username.
+
+    SECURITY: Returns 404 with generic message to prevent username enumeration.
+    Returns UserReadPublic to exclude sensitive fields (is_superadmin, signup_method).
+    """
+    # Get user
+    statement = select(User).where(User.username == username)
+    user = (await db_session.execute(statement)).scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="Resource not found",  # Generic message prevents enumeration
+        )
+
+    return UserReadPublic.model_validate(user)
+
+
+async def get_user_session(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+) -> UserSession:
+    # Get user
+    statement = select(User).where(User.user_uuid == current_user.user_uuid)
+    user = (await db_session.execute(statement)).scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=400,
+            detail="User does not exist",
+        )
+
+    user = UserRead.model_validate(user)
+
+    # Get roles and orgs in a single JOIN query (avoids N+1); cap at 100 to prevent
+    # unbounded result sets for users with many org memberships
+    statement = (
+        select(Role, Organization)
+        .join(UserOrganization, UserOrganization.role_id == Role.id)
+        .join(Organization, Organization.id == UserOrganization.org_id)
+        .where(UserOrganization.user_id == user.id)
+    )
+    results = (await db_session.execute(statement.limit(100))).all()
+    if len(results) == 100:  # pragma: no cover
+        logging.getLogger(__name__).warning(
+            "User %s has 100+ org memberships, result truncated", user.id
+        )
+
+    roles = []
+
+    for role, org in results:
+        roles.append(
+            UserRoleWithOrg(
+                role=RoleRead.model_validate(role),
+                org=OrganizationRead.model_validate(org),
+            )
+        )
+
+    user_session = UserSession(
+        user=user,
+        roles=roles,
+    )
+
+    return user_session
+
+
+async def authorize_user_action(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+    resource_uuid: str,
+    action: Literal["create", "read", "update", "delete"],
+):
+    # Get user
+    statement = select(User).where(User.user_uuid == current_user.user_uuid)
+    user = (await db_session.execute(statement)).scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=400,
+            detail="User does not exist",
+        )
+
+    # RBAC check
+    authorized = (
+        await authorization_verify_based_on_roles_and_authorship(
+            request, current_user.id, action, resource_uuid, db_session
+        )
+    )
+
+    if authorized:
+        return True
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not authorized to perform this action",
+        )
+
+
+async def delete_user_by_id(
+    request: Request,
+    db_session: AsyncSession,
+    current_user: PublicUser | AnonymousUser,
+    user_id: int,
+):
+    # Get user
+    statement = select(User).where(User.id == user_id)
+    user = (await db_session.execute(statement)).scalars().first()
+
+    if not user:
+        raise HTTPException(
+            status_code=400,
+            detail="User does not exist",
+        )
+
+    # RBAC check
+    await rbac_check(request, current_user, "delete", user.user_uuid, db_session)
+
+    # Capture identity before deletion for the confirmation ('goodbye') email.
+    deleted_email = user.email
+    deleted_username = user.username
+
+    from src.routers.users import _invalidate_session_cache
+
+    # Delete organizations the user is the SOLE admin of, so we don't leave
+    # behind orphaned, admin-less organizations when an account goes away.
+    # An org is deleted only when the user is one of its admins (role_id=1) AND
+    # no other admin remains. Orgs that still have another admin are kept; the
+    # user is simply removed from them via the membership cleanup below.
+    admin_org_ids = (await db_session.execute(
+        select(UserOrganization.org_id).where(
+            UserOrganization.user_id == user_id,
+            UserOrganization.role_id == ADMIN_ROLE_ID,
+        )
+    )).scalars().all()
+
+    for org_id in admin_org_ids:
+        other_admins = (await db_session.execute(
+            select(func.count()).select_from(UserOrganization).where(
+                UserOrganization.org_id == org_id,
+                UserOrganization.role_id == ADMIN_ROLE_ID,
+                UserOrganization.user_id != user_id,
+            )
+        )).scalar_one()
+
+        if other_admins:
+            # Another admin remains — keep the org, only drop this membership.
+            continue
+
+        org = (await db_session.execute(
+            select(Organization).where(Organization.id == org_id)
+        )).scalars().first()
+        if not org:
+            continue
+
+        # Capture every member so we can invalidate their cached sessions; their
+        # UserOrganization rows are removed via the CASCADE on the org FK.
+        member_ids = (await db_session.execute(
+            select(UserOrganization.user_id).where(UserOrganization.org_id == org_id)
+        )).scalars().all()
+
+        logging.warning(
+            "AUDIT: Organization auto-deleted on user deletion - "
+            f"org_id={org_id}, org_uuid={org.org_uuid}, org_name={org.name}, "
+            f"triggered_by_user_id={user_id}"
+        )
+
+        await db_session.delete(org)
+        await db_session.flush()
+
+        for member_id in member_ids:
+            _invalidate_session_cache(member_id)
+
+    # Remove any remaining org memberships (no CASCADE on this FK). Memberships
+    # of orgs deleted above are already gone via the org-level CASCADE.
+    user_orgs = (await db_session.execute(
+        select(UserOrganization).where(UserOrganization.user_id == user_id)
+    )).scalars().all()
+    for uo in user_orgs:
+        await db_session.delete(uo)
+
+    await db_session.flush()
+
+    # Delete user (all other FKs have ondelete="CASCADE")
+    await db_session.delete(user)
+    await db_session.commit()
+
+    # Best-effort deletion confirmation email.
+    if deleted_email:
+        try:
+            from src.services.users.emails import send_account_deleted_email
+            send_account_deleted_email(deleted_email, deleted_username or "")
+        except Exception:
+            logging.exception("send_account_deleted_email failed")
+
+    return {"detail": "User deleted successfully"}
+
+
+# Utils & Security functions
+
+
+async def security_get_user(request: Request, db_session: AsyncSession, email: str) -> User | None:
+    """
+    Get user by email for security/authentication purposes.
+
+    Returns None if user doesn't exist (rather than throwing an exception)
+    to allow the caller to handle the "user not found" case appropriately
+    and prevent email enumeration vulnerabilities.
+    """
+    # Check if user exists
+    statement = select(User).where(User.email == email)
+    user = (await db_session.execute(statement)).scalars().first()
+
+    if not user:
+        return None
+
+    user = User(**user.model_dump())
+
+    return user
+
+
+## 🔒 RBAC Utils ##
+
+
+async def rbac_check(
+    request: Request,
+    current_user: PublicUser | AnonymousUser,
+    action: Literal["create", "read", "update", "delete"],
+    user_uuid: str,
+    db_session: AsyncSession,
+):
+    if action == "create" or action == "read":
+        if current_user.id == 0:  # if user is anonymous
+            return True
+        else:
+            await authorization_verify_based_on_roles_and_authorship(
+                request, current_user.id, "create", "user_x", db_session
+            )
+
+    else:
+        await authorization_verify_if_user_is_anon(current_user.id)
+
+        # if user is the same as the one being read
+        if current_user.user_uuid == user_uuid:
+            return True
+
+        await authorization_verify_based_on_roles_and_authorship(
+            request, current_user.id, action, user_uuid, db_session
+        )
+
+
+## 🔒 RBAC Utils ##

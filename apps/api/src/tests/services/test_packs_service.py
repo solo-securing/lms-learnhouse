@@ -1,0 +1,398 @@
+"""Tests for src/services/packs/packs.py."""
+
+from datetime import datetime
+from fnmatch import fnmatch
+from unittest.mock import Mock, patch
+
+import pytest
+from fastapi import HTTPException
+
+from src.db.packs import OrgPack, PackStatusEnum, PackTypeEnum
+from src.services.packs.packs import (
+    _apply_pack_credits,
+    _remove_ai_credits,
+    _revoke_pack_credits,
+    activate_pack,
+    deactivate_all_packs_for_org,
+    deactivate_pack,
+    get_org_active_packs,
+    get_org_pack_summary,
+    mark_pack_canceling,
+    reconcile_pack_credits,
+)
+
+
+class FakeRedis:
+    def __init__(self, initial=None):
+        self.values = dict(initial or {})
+
+    def _normalize(self, key):
+        return key.decode() if isinstance(key, bytes) else key
+
+    def incrby(self, key, amount):
+        key = self._normalize(key)
+        value = int(self.values.get(key, 0)) + amount
+        self.values[key] = value
+        return value
+
+    def decrby(self, key, amount):
+        key = self._normalize(key)
+        value = int(self.values.get(key, 0)) - amount
+        self.values[key] = value
+        return value
+
+    def get(self, key):
+        return self.values.get(self._normalize(key))
+
+    def set(self, key, value):
+        self.values[self._normalize(key)] = value
+
+    def scan_iter(self, match=None):
+        for key in list(self.values):
+            if match is None or fnmatch(key, match):
+                yield key.encode()
+
+
+class FakeTask:
+    def add_done_callback(self, callback):
+        callback(self)
+
+
+def _fake_create_task(task):
+    def _create_task(coro):
+        coro.close()
+        return task
+
+    return _create_task
+
+
+async def _make_pack(db, org, **overrides):
+    pack = OrgPack(
+        id=overrides.pop("id", None),
+        org_id=overrides.pop("org_id", org.id),
+        pack_type=overrides.pop("pack_type", PackTypeEnum.ai_credits),
+        pack_id=overrides.pop("pack_id", "ai_500"),
+        quantity=overrides.pop("quantity", 500),
+        status=overrides.pop("status", PackStatusEnum.active),
+        activated_at=overrides.pop("activated_at", datetime(2024, 1, 1)),
+        cancelled_at=overrides.pop("cancelled_at", None),
+        cancel_at_period_end=overrides.pop("cancel_at_period_end", False),
+        platform_subscription_id=overrides.pop(
+            "platform_subscription_id", "sub_123"
+        ),
+    )
+    db.add(pack)
+    await db.commit()
+    await db.refresh(pack)
+    return pack
+
+
+class TestPackHelpers:
+    def test_credit_helpers_and_dispatchers(self):
+        redis = FakeRedis({"ai_credits_purchased:1": 2})
+
+        with patch(
+            "src.services.packs.packs._get_redis_client",
+            return_value=redis,
+        ), patch(
+            "src.services.packs.packs.add_ai_credits",
+            side_effect=lambda org_id, amount: redis.incrby(
+                f"ai_credits_purchased:{org_id}", amount
+            ),
+        ):
+            assert _remove_ai_credits(1, 5) == 0
+
+            _apply_pack_credits(1, {"type": "ai_credits", "quantity": 6})
+            _revoke_pack_credits(1, PackTypeEnum.ai_credits, 1)
+
+        assert redis.values["ai_credits_purchased:1"] == 5
+
+
+class TestPackLifecycle:
+    @pytest.mark.asyncio
+    async def test_activate_pack_create_reactivate_and_guards(self, db, org, other_org):
+        redis = FakeRedis()
+        background_tasks = Mock()
+        fake_task = FakeTask()
+
+        with patch(
+            "src.services.packs.packs._get_redis_client",
+            return_value=redis,
+        ), patch(
+            "src.services.packs.packs.add_ai_credits",
+            side_effect=lambda org_id, amount: redis.incrby(
+                f"ai_credits_purchased:{org_id}", amount
+            ),
+        ), patch(
+            "src.services.packs.packs.dispatch_webhooks",
+            new=Mock(),
+        ) as dispatch_webhooks, patch(
+            "src.services.packs.packs.asyncio.create_task",
+            side_effect=_fake_create_task(fake_task),
+        ) as create_task, patch(
+            "src.services.packs.packs._background_tasks",
+            new=background_tasks,
+        ):
+            created = await activate_pack(
+                org.id,
+                "ai_500",
+                "sub_new",
+                db,
+            )
+
+            active = await _make_pack(
+                db,
+                org,
+                id=3,
+                pack_id="ai_500_active",
+                pack_type=PackTypeEnum.ai_credits,
+                quantity=500,
+                status=PackStatusEnum.active,
+                platform_subscription_id="sub_active",
+            )
+            same_org = await activate_pack(
+                org.id,
+                "ai_500",
+                "sub_active",
+                db,
+            )
+
+            foreign = await _make_pack(
+                db,
+                other_org,
+                id=4,
+                pack_id="ai_500_other",
+                pack_type=PackTypeEnum.ai_credits,
+                quantity=500,
+                status=PackStatusEnum.active,
+                platform_subscription_id="sub_foreign",
+            )
+            with pytest.raises(HTTPException) as unknown_exc:
+                await activate_pack(org.id, "missing_pack", "sub_missing", db)
+
+            with pytest.raises(HTTPException) as cross_org_exc:
+                await activate_pack(org.id, "ai_500", "sub_foreign", db)
+
+        assert created.pack_id == "ai_500"
+        assert redis.values["ai_credits_purchased:1"] == 500
+        assert same_org.id == active.id
+        assert foreign.org_id == other_org.id
+        assert unknown_exc.value.status_code == 400
+        assert cross_org_exc.value.status_code == 409
+        dispatch_webhooks.assert_called()
+        create_task.assert_called()
+        background_tasks.add.assert_called()
+        background_tasks.discard.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_activate_pack_reactivates_cancelled_ai_credits(self, db, org):
+        # Reactivating a cancelled AI-credits pack must re-add the stored
+        # quantity of AI credits to Redis (the ai_credits branch).
+        redis = FakeRedis()
+        background_tasks = Mock()
+        fake_task = FakeTask()
+
+        await _make_pack(
+            db,
+            org,
+            id=40,
+            pack_id="ai_500",
+            pack_type=PackTypeEnum.ai_credits,
+            quantity=500,
+            status=PackStatusEnum.cancelled,
+            platform_subscription_id="sub_ai_reactivate",
+            cancelled_at=datetime(2024, 2, 1),
+            cancel_at_period_end=True,
+        )
+
+        with patch(
+            "src.services.packs.packs._get_redis_client",
+            return_value=redis,
+        ), patch(
+            "src.services.packs.packs.add_ai_credits",
+            side_effect=lambda org_id, amount: redis.incrby(
+                f"ai_credits_purchased:{org_id}", amount
+            ),
+        ) as add_ai_credits, patch(
+            "src.services.packs.packs.dispatch_webhooks",
+            new=Mock(),
+        ), patch(
+            "src.services.packs.packs.asyncio.create_task",
+            side_effect=_fake_create_task(fake_task),
+        ), patch(
+            "src.services.packs.packs._background_tasks",
+            new=background_tasks,
+        ):
+            reactivated = await activate_pack(
+                org.id,
+                "ai_500",
+                "sub_ai_reactivate",
+                db,
+            )
+
+        assert reactivated.status == PackStatusEnum.active
+        assert reactivated.cancel_at_period_end is False
+        assert reactivated.cancelled_at is None
+        add_ai_credits.assert_called_once_with(org.id, 500)
+        assert redis.values["ai_credits_purchased:1"] == 500
+
+    @pytest.mark.asyncio
+    async def test_deactivate_pack_and_deactivate_all(self, db, org):
+        redis = FakeRedis(
+            {
+                "ai_credits_purchased:1": 500,
+            }
+        )
+        background_tasks = Mock()
+        fake_task = FakeTask()
+
+        await _make_pack(
+            db,
+            org,
+            id=10,
+            pack_id="ai_500",
+            pack_type=PackTypeEnum.ai_credits,
+            quantity=500,
+            platform_subscription_id="sub_ai",
+        )
+        await _make_pack(
+            db,
+            org,
+            id=11,
+            pack_id="ai_500",
+            pack_type=PackTypeEnum.ai_credits,
+            quantity=100,
+            platform_subscription_id="sub_ai2",
+        )
+        await _make_pack(
+            db,
+            org,
+            id=12,
+            pack_id="cancelled",
+            pack_type=PackTypeEnum.ai_credits,
+            quantity=100,
+            status=PackStatusEnum.cancelled,
+            platform_subscription_id="sub_cancelled",
+            cancelled_at=datetime(2024, 1, 3),
+        )
+
+        with patch(
+            "src.services.packs.packs._get_redis_client",
+            return_value=redis,
+        ), patch(
+            "src.services.packs.packs.dispatch_webhooks",
+            new=Mock(),
+        ) as dispatch_webhooks, patch(
+            "src.services.packs.packs.asyncio.create_task",
+            side_effect=_fake_create_task(fake_task),
+        ) as create_task, patch(
+            "src.services.packs.packs._background_tasks",
+            new=background_tasks,
+        ):
+            cancelled_result = await deactivate_pack(org.id, "sub_cancelled", db)
+            deactivated_ai = await deactivate_pack(org.id, "sub_ai", db)
+            deactivated_count = await deactivate_all_packs_for_org(org.id, db)
+
+            with pytest.raises(HTTPException) as missing_exc:
+                await deactivate_pack(org.id, "missing-sub", db)
+
+            with pytest.raises(HTTPException) as canceling_exc:
+                await mark_pack_canceling(org.id, "missing-sub", db)
+
+        assert cancelled_result.status == PackStatusEnum.cancelled
+        assert deactivated_ai.status == PackStatusEnum.cancelled
+        assert redis.values["ai_credits_purchased:1"] == 0
+        assert deactivated_count == 1
+        assert missing_exc.value.status_code == 404
+        assert canceling_exc.value.status_code == 404
+        dispatch_webhooks.assert_called()
+        create_task.assert_called()
+        background_tasks.add.assert_called()
+        background_tasks.discard.assert_called()
+
+    @pytest.mark.asyncio
+    async def test_get_org_pack_summary_and_mark_canceling(self, db, org):
+        await _make_pack(
+            db,
+            org,
+            id=20,
+            pack_id="ai_500",
+            pack_type=PackTypeEnum.ai_credits,
+            quantity=500,
+            platform_subscription_id="sub_ai_summary",
+        )
+        await _make_pack(
+            db,
+            org,
+            id=21,
+            pack_id="ai_500_b",
+            pack_type=PackTypeEnum.ai_credits,
+            quantity=200,
+            platform_subscription_id="sub_ai_summary_b",
+        )
+        await _make_pack(
+            db,
+            org,
+            id=22,
+            pack_id="cancelled_summary",
+            pack_type=PackTypeEnum.ai_credits,
+            quantity=100,
+            status=PackStatusEnum.cancelled,
+            platform_subscription_id="sub_cancelled_summary",
+        )
+
+        summary = await get_org_pack_summary(org.id, db)
+        active = await get_org_active_packs(org.id, db)
+        marked = await mark_pack_canceling(org.id, "sub_ai_summary", db)
+
+        assert summary == {
+            "ai_credits": 700,
+            "active_pack_count": 2,
+        }
+        assert {pack.pack_id for pack in active} == {"ai_500", "ai_500_b"}
+        assert marked.cancel_at_period_end is True
+
+    @pytest.mark.asyncio
+    async def test_reconcile_pack_credits(self, db, org, other_org):
+        await _make_pack(
+            db,
+            org,
+            id=30,
+            pack_id="ai_500",
+            pack_type=PackTypeEnum.ai_credits,
+            quantity=500,
+            platform_subscription_id="sub_ai_reconcile",
+        )
+        await _make_pack(
+            db,
+            other_org,
+            id=32,
+            pack_id="ai_500_other",
+            pack_type=PackTypeEnum.ai_credits,
+            quantity=500,
+            platform_subscription_id="sub_ai_other",
+        )
+
+        redis = FakeRedis(
+            {
+                "ai_credits_purchased:1": 125,
+                "ai_credits_purchased:2": 500,
+                "ai_credits_purchased:3": 66,
+                "ai_credits_purchased:bad": 50,
+            }
+        )
+
+        with patch(
+            "src.services.packs.packs._get_redis_client",
+            return_value=redis,
+        ):
+            result = await reconcile_pack_credits(db)
+
+        assert result == {
+            "orgs": 2,
+            "ai_credits_fixed": 2,
+        }
+        assert redis.values["ai_credits_purchased:1"] == 500
+        assert redis.values["ai_credits_purchased:2"] == 500
+        assert redis.values["ai_credits_purchased:3"] == 0
+        assert redis.values["ai_credits_purchased:bad"] == 50

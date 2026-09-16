@@ -1,0 +1,69 @@
+name: API Tests
+permissions:
+  contents: read
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - "apps/api/**"
+  pull_request:
+    paths:
+      - "apps/api/**"
+
+# See api-lint.yaml — one live run per PR, dev runs always finish.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: latest
+          # Resolving and downloading the API's wheels from scratch on every
+          # run is pure repetition — the lockfile is what decides the answer,
+          # so key the cache on it.
+          enable-cache: true
+          cache-dependency-glob: "apps/api/uv.lock"
+
+      - name: Install ffmpeg
+        # Required by the video faststart / HLS transcode tests (they skip
+        # without it, which would leave that code uncovered).
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Install dependencies
+        run: uv sync
+        working-directory: apps/api
+
+      - name: Run tests with coverage
+        run: uv run pytest src/tests/ -v --tb=short --cov=src --cov-report=html --cov-report=term-missing --cov-report=xml:coverage.xml --cov-fail-under=25
+        working-directory: apps/api
+        env:
+          TESTING: "true"
+
+      - name: Upload API coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: apps/api/coverage.xml
+          flags: api
+          name: api-coverage
+          fail_ci_if_error: true
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: api-coverage-report
+          path: apps/api/htmlcov/
+          retention-days: 30

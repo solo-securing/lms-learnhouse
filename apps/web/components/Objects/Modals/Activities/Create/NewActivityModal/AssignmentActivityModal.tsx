@@ -1,0 +1,494 @@
+import React from 'react'
+import * as Form from '@radix-ui/react-form'
+import { BarLoader } from 'react-spinners'
+import { Backpack } from '@phosphor-icons/react'
+import { useOrg } from '@components/Contexts/OrgContext'
+import { useQueryClient } from '@tanstack/react-query'
+import { queryKeys } from '@/lib/query/keys'
+import { createAssignment } from '@services/courses/assignments'
+import { useLHSession } from '@components/Contexts/LHSessionContext'
+import { createActivity, deleteActivity } from '@services/courses/activities'
+import toast from 'react-hot-toast'
+import { useTranslation } from 'react-i18next'
+import { useLHAnalytics, AnalyticsEvent } from '@services/analytics'
+import { useUpgradeModal } from '@components/Dashboard/Shared/PlanRestricted/UpgradeModalContext'
+import { getErrorMessage } from '@services/utils/ts/errorMessage'
+import {
+  ALargeSmall,
+  Hash,
+  Percent,
+  ThumbsUp,
+  GraduationCap,
+  Check,
+  Zap,
+  Shield,
+  Eye,
+  RotateCcw,
+  Infinity as InfinityIcon,
+  ClipboardCheck,
+} from 'lucide-react'
+
+function NewAssignment({ submitActivity: _submitActivity, chapterId, course, closeModal }: any) {
+  const { t } = useTranslation()
+  const org = useOrg() as any
+  const session = useLHSession() as any
+  const queryClient = useQueryClient()
+  const { track } = useLHAnalytics('dashboard')
+  const { handlePlanLimit } = useUpgradeModal()
+  const cleanCourseUuid = (id: string) => id?.replace(/^course_/, '') ?? id
+  const _withUnpublishedActivities = course
+    ? course.withUnpublishedActivities
+    : false
+  const [activityName, setActivityName] = React.useState('')
+  const [isSubmitting, setIsSubmitting] = React.useState(false)
+  const [activityDescription, setActivityDescription] = React.useState('')
+  const [dueDate, setDueDate] = React.useState('')
+  const [gradingType, setGradingType] = React.useState('ALPHABET')
+  const [autoGrading, setAutoGrading] = React.useState(false)
+  const [antiCopyPaste, setAntiCopyPaste] = React.useState(false)
+  const [showCorrectAnswers, setShowCorrectAnswers] = React.useState(false)
+  const [allowRetries, setAllowRetries] = React.useState(false)
+  const [maxRetries, setMaxRetries] = React.useState(0)
+  // Formative mode: handed in, never marked. The model answer that pairs with
+  // it is authored afterwards in the assignment editor.
+  const [ungraded, setUngraded] = React.useState(false)
+
+  const handleSubmit = async (e: any) => {
+    e.preventDefault()
+    setIsSubmitting(true)
+    const activity = {
+      name: activityName,
+      chapter_id: chapterId,
+      activity_type: 'TYPE_ASSIGNMENT',
+      activity_sub_type: 'SUBTYPE_ASSIGNMENT_ANY',
+      published: false,
+      course_id: course?.courseStructure.id,
+    }
+
+    const activity_res = await createActivity(
+      activity,
+      chapterId,
+      org?.id,
+      session.data?.tokens?.access_token
+    )
+    const res = await createAssignment(
+      {
+        title: activityName,
+        description: activityDescription,
+        // Empty means no deadline; send null rather than an empty string so the
+        // column reads as unset instead of as a value nothing can parse.
+        due_date: dueDate || null,
+        grading_type: gradingType,
+        ungraded: ungraded,
+        // An ungraded assignment never auto-grades and has no answer key to
+        // reveal — send the consistent state instead of dead flags.
+        auto_grading: ungraded ? false : autoGrading,
+        anti_copy_paste: antiCopyPaste,
+        show_correct_answers: ungraded ? false : showCorrectAnswers,
+        allow_retries: allowRetries,
+        max_retries: allowRetries ? maxRetries : 0,
+        course_id: course?.courseStructure.id,
+        org_id: org?.id,
+        chapter_id: chapterId,
+        activity_id: activity_res?.id,
+      },
+      session.data?.tokens?.access_token
+    )
+    const toast_loading = toast.loading(
+      t('dashboard.assignments.modals.create.toasts.creating')
+    )
+
+    if (res.success) {
+      toast.dismiss(toast_loading)
+      toast.success(t('dashboard.assignments.modals.create.toasts.success'))
+      track(AnalyticsEvent.AssignmentCreated, {
+        grading_type: gradingType,
+        auto_grading: autoGrading,
+        allow_retries: allowRetries,
+        has_due_date: !!dueDate,
+      })
+    } else {
+      toast.dismiss(toast_loading)
+      // Assignments are quota-limited on the free plan → offer an upgrade
+      // rather than a dead-end error toast.
+      if (!handlePlanLimit(res, { source: 'assignment_create', feature: 'assignments', requiredPlan: 'standard' })) {
+        toast.error(getErrorMessage(res.data?.detail, t('dashboard.assignments.modals.create.toasts.error')))
+      }
+      await deleteActivity(
+        activity_res.activity_uuid,
+        session.data?.tokens?.access_token
+      )
+    }
+
+    queryClient.invalidateQueries({ queryKey: queryKeys.courses.meta(cleanCourseUuid(course.courseStructure.course_uuid)) })
+    queryClient.invalidateQueries({ queryKey: ['courses'] })
+    queryClient.invalidateQueries({ queryKey: ['assignments'] })
+    setIsSubmitting(false)
+    closeModal()
+  }
+
+  const inputClass =
+    'w-full h-9 px-3 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors'
+
+  return (
+    <Form.Root onSubmit={handleSubmit} className="space-y-4">
+      <div
+        className="relative flex items-center justify-center h-20 rounded-xl overflow-hidden"
+        style={{
+          backgroundImage:
+            'repeating-linear-gradient(90deg, transparent, transparent 5px, rgba(253,230,138,0.25) 5px, rgba(253,230,138,0.25) 6px)',
+        }}
+      >
+        <span className="flex items-center gap-2 bg-white nice-shadow rounded-full px-4 py-1.5 text-sm font-medium text-gray-600">
+          <Backpack size={18} weight="duotone" className="text-amber-400" />
+          {t('dashboard.courses.structure.activity.types.assignments')}
+        </span>
+      </div>
+
+      {/* Basic info */}
+      <div className="rounded-xl nice-shadow p-4 space-y-4">
+        <Form.Field name="assignment-activity-title" className="space-y-1.5">
+          <Form.Label className="text-sm font-medium text-gray-700">
+            {t('dashboard.assignments.modals.create.form.title_label')}
+          </Form.Label>
+          <Form.Message match="valueMissing" className="text-xs text-red-500">
+            {t('dashboard.assignments.modals.create.form.title_required')}
+          </Form.Message>
+          <Form.Control asChild>
+            <input
+              onChange={(e) => setActivityName(e.target.value)}
+              type="text"
+              required
+              className={inputClass}
+            />
+          </Form.Control>
+        </Form.Field>
+
+        <Form.Field
+          name="assignment-activity-description"
+          className="space-y-1.5"
+        >
+          <Form.Label className="text-sm font-medium text-gray-700">
+            {t('dashboard.assignments.modals.create.form.description_label')}
+          </Form.Label>
+          <Form.Message match="valueMissing" className="text-xs text-red-500">
+            {t('dashboard.assignments.modals.create.form.description_required')}
+          </Form.Message>
+          <Form.Control asChild>
+            <textarea
+              onChange={(e) => setActivityDescription(e.target.value)}
+              required
+              rows={3}
+              className="w-full px-3 py-2 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors resize-none"
+            />
+          </Form.Control>
+        </Form.Field>
+
+        {/* Optional: a self-paced course has no date that means anything to a
+            learner who enrolled today. */}
+        <Form.Field
+          name="assignment-activity-due-date"
+          className="space-y-1.5"
+        >
+          <div className="flex items-center justify-between">
+            <Form.Label className="text-sm font-medium text-gray-700">
+              {t('dashboard.assignments.modals.create.form.due_date_label')}
+            </Form.Label>
+            {dueDate && (
+              <button
+                type="button"
+                onClick={() => setDueDate('')}
+                className="text-[10px] font-medium text-gray-400 hover:text-gray-700 transition-colors"
+              >
+                {t('dashboard.assignments.modals.create.form.due_date_clear')}
+              </button>
+            )}
+          </div>
+          <Form.Control asChild>
+            <input
+              onChange={(e) => setDueDate(e.target.value)}
+              value={dueDate}
+              type="date"
+              className={inputClass}
+            />
+          </Form.Control>
+          <p className="text-[10px] text-gray-400">
+            {t('dashboard.assignments.modals.create.form.due_date_hint')}
+          </p>
+        </Form.Field>
+      </div>
+
+      {/* Grading type — irrelevant on a formative assignment, which never
+          produces a grade to display in any scale. */}
+      {!ungraded && (
+      <div className="rounded-xl nice-shadow p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <p className="text-sm font-medium text-gray-700">
+            {t('dashboard.assignments.modals.create.form.grading_type_label')}
+          </p>
+          <p className="text-[10px] text-gray-400">
+            {t('dashboard.assignments.modals.create.form.grading_type_hint')}
+          </p>
+        </div>
+        <GradingTypeSelector
+          value={gradingType}
+          onChange={setGradingType}
+          translationPrefix="dashboard.assignments.modals.create.form"
+        />
+      </div>
+      )}
+
+      {/* Grading options */}
+      <div className="rounded-xl nice-shadow p-4 space-y-3">
+        <div className="flex items-center justify-between">
+          <p className="text-sm font-medium text-gray-700">
+            {t('dashboard.assignments.modals.create.form.grading_options_label')}
+          </p>
+          <p className="text-[10px] text-gray-400">
+            {t('dashboard.assignments.modals.create.form.grading_options_hint')}
+          </p>
+        </div>
+        <div className="space-y-2">
+          <SmallToggleRow
+            icon={<ClipboardCheck size={16} className="text-teal-500" />}
+            label={t('dashboard.assignments.modals.edit.form.ungraded_label', { defaultValue: 'Formative — no grading' })}
+            description={t('dashboard.assignments.modals.create.form.ungraded_description', { defaultValue: 'Learners hand their work in and it is never marked. Add a model answer in the assignment editor to unlock on hand-in.' })}
+            checked={ungraded}
+            onChange={setUngraded}
+          />
+          {!ungraded && (
+          <SmallToggleRow
+            icon={<Zap size={16} className="text-amber-500" />}
+            label={t('dashboard.assignments.modals.create.form.auto_grading_label')}
+            description={t('dashboard.assignments.modals.create.form.auto_grading_description')}
+            checked={autoGrading}
+            onChange={setAutoGrading}
+          />
+          )}
+          <SmallToggleRow
+            icon={<Shield size={16} className="text-cyan-500" />}
+            label={t('dashboard.assignments.modals.create.form.anti_copy_paste_label')}
+            description={t('dashboard.assignments.modals.create.form.anti_copy_paste_description')}
+            checked={antiCopyPaste}
+            onChange={setAntiCopyPaste}
+          />
+          {!ungraded && (
+          <SmallToggleRow
+            icon={<Eye size={16} className="text-indigo-500" />}
+            label={t('dashboard.assignments.modals.create.form.show_correct_answers_label')}
+            description={t('dashboard.assignments.modals.create.form.show_correct_answers_description')}
+            checked={showCorrectAnswers}
+            onChange={setShowCorrectAnswers}
+          />
+          )}
+          <div className="rounded-xl border border-gray-100 bg-white overflow-hidden">
+            <div className="flex items-start justify-between gap-3 p-3">
+              <div className="flex items-start gap-2.5 flex-1 min-w-0">
+                <div className="mt-0.5 flex-none">
+                  <RotateCcw size={16} className="text-fuchsia-500" />
+                </div>
+                <div className="flex flex-col min-w-0">
+                  <p className="text-xs font-bold text-gray-900">
+                    {t('dashboard.assignments.modals.edit.form.allow_retries_label')}
+                  </p>
+                  <p className="text-[10px] text-gray-500 leading-snug mt-0.5">
+                    {/* The default copy says retries happen "after it's graded",
+                        which never comes true in formative mode. */}
+                    {ungraded
+                      ? t('dashboard.assignments.modals.edit.form.allow_retries_description_ungraded', {
+                          defaultValue:
+                            'Let learners reset and hand the assignment in again. Each retry wipes their previous work and re-locks the model answer.',
+                        })
+                      : t('dashboard.assignments.modals.edit.form.allow_retries_description')}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAllowRetries(!allowRetries)}
+                aria-pressed={allowRetries}
+                className={`relative flex-none inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                  allowRetries ? 'bg-gray-900' : 'bg-gray-200 hover:bg-gray-300'
+                }`}
+              >
+                <span
+                  className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+                    allowRetries ? 'translate-x-5 rtl:-translate-x-5' : 'translate-x-1 rtl:-translate-x-1'
+                  }`}
+                />
+              </button>
+            </div>
+            {allowRetries && (
+              <div className="border-t border-gray-100 px-3 py-3 bg-gray-50/50">
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex flex-col min-w-0">
+                    <p className="text-[11px] font-semibold text-gray-700">
+                      {t('dashboard.assignments.modals.edit.form.max_retries_label')}
+                    </p>
+                    <p className="text-[10px] text-gray-500 leading-snug mt-0.5 flex items-center gap-1">
+                      {maxRetries === 0 ? (
+                        <>
+                          <InfinityIcon size={11} className="text-fuchsia-500" />
+                          <span>{t('dashboard.assignments.modals.edit.form.max_retries_unlimited')}</span>
+                        </>
+                      ) : (
+                        <span>{t('dashboard.assignments.modals.edit.form.max_retries_bounded')}</span>
+                      )}
+                    </p>
+                  </div>
+                  <div className="flex-none flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setMaxRetries(Math.max(0, maxRetries - 1))}
+                      className="h-7 w-7 rounded-md bg-white border border-gray-200 nice-shadow text-gray-600 hover:bg-gray-50 text-sm font-bold"
+                    >
+                      −
+                    </button>
+                    <input
+                      type="number"
+                      min={0}
+                      max={20}
+                      value={maxRetries}
+                      onChange={(e) => {
+                        const raw = parseInt(e.target.value, 10)
+                        setMaxRetries(isNaN(raw) ? 0 : Math.max(0, Math.min(20, raw)))
+                      }}
+                      className="w-12 h-7 text-center text-sm font-bold text-gray-900 bg-white border border-gray-200 rounded-md outline-none focus:ring-1 focus:ring-gray-300"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setMaxRetries(Math.min(20, maxRetries + 1))}
+                      className="h-7 w-7 rounded-md bg-white border border-gray-200 nice-shadow text-gray-600 hover:bg-gray-50 text-sm font-bold"
+                    >
+                      +
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+
+      <div className="flex justify-end">
+        <Form.Submit asChild>
+          <button
+            type="submit"
+            disabled={isSubmitting}
+            className="inline-flex items-center justify-center h-9 px-5 text-sm font-medium text-white bg-black rounded-lg hover:bg-gray-800 transition-colors disabled:opacity-50"
+          >
+            {isSubmitting ? (
+              <BarLoader
+                cssOverride={{ borderRadius: 60 }}
+                width={60}
+                color="#ffffff"
+              />
+            ) : (
+              t('dashboard.assignments.modals.create.form.submit')
+            )}
+          </button>
+        </Form.Submit>
+      </div>
+    </Form.Root>
+  )
+}
+
+const GRADING_TYPE_OPTIONS: {
+  value: string
+  labelKey: string
+  descriptionKey: string
+  icon: React.ReactNode
+  color: string
+  selectedBorder: string
+  selectedBg: string
+  illustration: string
+}[] = [
+  { value: 'ALPHABET', labelKey: 'grading_types.alphabet', descriptionKey: 'grading_type_descriptions.alphabet', icon: <ALargeSmall size={18} />, color: 'text-violet-600', selectedBorder: 'border-violet-400', selectedBg: 'bg-violet-50', illustration: 'A  B  C' },
+  { value: 'NUMERIC', labelKey: 'grading_types.numeric', descriptionKey: 'grading_type_descriptions.numeric', icon: <Hash size={18} />, color: 'text-blue-600', selectedBorder: 'border-blue-400', selectedBg: 'bg-blue-50', illustration: '0 — 100' },
+  { value: 'PERCENTAGE', labelKey: 'grading_types.percentage', descriptionKey: 'grading_type_descriptions.percentage', icon: <Percent size={18} />, color: 'text-emerald-600', selectedBorder: 'border-emerald-400', selectedBg: 'bg-emerald-50', illustration: '85%' },
+  { value: 'PASS_FAIL', labelKey: 'grading_types.pass_fail', descriptionKey: 'grading_type_descriptions.pass_fail', icon: <ThumbsUp size={18} />, color: 'text-amber-600', selectedBorder: 'border-amber-400', selectedBg: 'bg-amber-50', illustration: 'P / F' },
+  { value: 'GPA_SCALE', labelKey: 'grading_types.gpa_scale', descriptionKey: 'grading_type_descriptions.gpa_scale', icon: <GraduationCap size={18} />, color: 'text-rose-600', selectedBorder: 'border-rose-400', selectedBg: 'bg-rose-50', illustration: '0.0 — 4.0' },
+]
+
+function GradingTypeSelector({ value, onChange, translationPrefix }: { value: string; onChange: (_v: string) => void; translationPrefix: string }) {
+  const { t } = useTranslation()
+  return (
+    <div className="grid grid-cols-3 gap-2">
+      {GRADING_TYPE_OPTIONS.map((gt) => {
+        const isSelected = value === gt.value
+        return (
+          <button
+            key={gt.value}
+            type="button"
+            onClick={() => onChange(gt.value)}
+            className={`relative flex flex-col items-center text-center p-3 rounded-xl nice-shadow bg-white transition-all cursor-pointer ${
+              isSelected
+                ? `${gt.selectedBg} ring-2 ${gt.selectedBorder.replace('border-', 'ring-')}`
+                : 'hover:bg-gray-50/60'
+            }`}
+          >
+            {isSelected && (
+              <div className={`absolute top-1.5 end-1.5 w-3.5 h-3.5 rounded-full flex items-center justify-center ${gt.color} bg-white nice-shadow`}>
+                <Check size={8} strokeWidth={3} />
+              </div>
+            )}
+            <div className={`text-sm font-mono font-bold mb-1.5 tracking-wider ${isSelected ? gt.color : 'text-gray-300'}`}>
+              {gt.illustration}
+            </div>
+            <div className={`mb-0.5 ${isSelected ? gt.color : 'text-gray-400'}`}>
+              {gt.icon}
+            </div>
+            <p className={`text-[11px] font-bold ${isSelected ? 'text-gray-900' : 'text-gray-500'}`}>
+              {t(`${translationPrefix}.${gt.labelKey}`)}
+            </p>
+            <p className='text-[9px] text-gray-400 mt-0.5 leading-tight'>
+              {t(`${translationPrefix}.${gt.descriptionKey}`)}
+            </p>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+function SmallToggleRow({
+  icon,
+  label,
+  description,
+  checked,
+  onChange,
+}: {
+  icon: React.ReactNode
+  label: string
+  description: string
+  checked: boolean
+  onChange: (_next: boolean) => void
+}) {
+  return (
+    <div className="flex items-start justify-between gap-3 p-2.5 rounded-lg border border-gray-100 bg-white">
+      <div className="flex items-start gap-2 flex-1 min-w-0">
+        <div className="mt-0.5 flex-none">{icon}</div>
+        <div className="flex flex-col min-w-0">
+          <p className="text-xs font-bold text-gray-900">{label}</p>
+          <p className="text-[10px] text-gray-500 leading-snug mt-0.5">{description}</p>
+        </div>
+      </div>
+      <button
+        type="button"
+        onClick={() => onChange(!checked)}
+        aria-pressed={checked}
+        className={`relative flex-none inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+          checked ? 'bg-gray-900' : 'bg-gray-200 hover:bg-gray-300'
+        }`}
+      >
+        <span
+          className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white shadow transition-transform ${
+            checked ? 'translate-x-5 rtl:-translate-x-5' : 'translate-x-1 rtl:-translate-x-1'
+          }`}
+        />
+      </button>
+    </div>
+  )
+}
+
+export default NewAssignment

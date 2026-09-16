@@ -1,0 +1,319 @@
+import { getAPIUrl } from '@services/config/config'
+import {
+  errorHandling,
+  RequestBodyWithAuthHeader,
+  RequestBodyFormWithAuthHeader,
+} from '@services/utils/ts/requests'
+
+/*
+ This file includes only POST, PUT, DELETE requests
+ GET requests are called from the frontend using SWR (https://swr.vercel.app/)
+*/
+
+export async function updateOrganization(
+  org_id: string,
+  data: any,
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/` + org_id,
+    RequestBodyWithAuthHeader('PUT', data, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export async function uploadOrganizationLogo(
+  org_id: string,
+  logo_file: any,
+  access_token: string
+) {
+  // Send file thumbnail as form data
+  const formData = new FormData()
+  formData.append('logo_file', logo_file)
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/` + org_id + '/logo',
+    RequestBodyFormWithAuthHeader('PUT', formData, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export async function uploadOrganizationThumbnail(
+  org_id: string,
+  thumbnail_file: any,
+  access_token: string
+) {
+  // Send file thumbnail as form data
+  const formData = new FormData()
+  formData.append('thumbnail_file', thumbnail_file)
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/` + org_id + '/thumbnail',
+    RequestBodyFormWithAuthHeader('PUT', formData, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export const uploadOrganizationPreview = async (orgId: string, file: File, access_token: string) => {
+  const formData = new FormData();
+  formData.append('preview_file', file);
+
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/` + orgId + '/preview',
+    RequestBodyFormWithAuthHeader('PUT', formData, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+};
+
+export async function updateOrgCommunitiesConfig(
+  org_id: string,
+  communities_enabled: boolean,
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/config/communities?communities_enabled=${communities_enabled}`,
+    RequestBodyWithAuthHeader('PUT', null, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export async function updateOrgColorConfig(
+  org_id: string,
+  color: string,
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/config/color?color=${encodeURIComponent(color)}`,
+    RequestBodyWithAuthHeader('PUT', null, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export async function updateOrgFooterTextConfig(
+  org_id: string,
+  footer_text: string,
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/config/footer_text?footer_text=${encodeURIComponent(footer_text)}`,
+    RequestBodyWithAuthHeader('PUT', null, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+/**
+ * Set the display name shown on transactional email for this organization.
+ *
+ * Only the NAME is configurable — the sending address stays the platform's
+ * verified system address, so SPF/DKIM keep aligning. Pass an empty string to
+ * fall back to the platform default.
+ */
+export async function updateOrgEmailSenderNameConfig(
+  org_id: string,
+  email_sender_name: string,
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/config/email_sender_name?email_sender_name=${encodeURIComponent(email_sender_name)}`,
+    RequestBodyWithAuthHeader('PUT', null, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export async function updateOrgFontConfig(
+  org_id: string,
+  font: string,
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/config/font?font=${encodeURIComponent(font)}`,
+    RequestBodyWithAuthHeader('PUT', null, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export async function updateOrgDefaultLanguageConfig(
+  org_id: string,
+  default_language: string,
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/config/default_language?default_language=${encodeURIComponent(default_language)}`,
+    RequestBodyWithAuthHeader('PUT', null, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export interface AuthBrandingConfig {
+  welcome_message: string
+  background_type: 'gradient' | 'custom' | 'unsplash'
+  background_image: string
+  text_color: 'light' | 'dark'
+  unsplash_photographer_name?: string
+  unsplash_photographer_url?: string
+  unsplash_photo_url?: string
+}
+
+export async function updateOrgAuthBrandingConfig(
+  org_id: string,
+  auth_branding: AuthBrandingConfig,
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/config/auth_branding`,
+    RequestBodyWithAuthHeader('PUT', auth_branding, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export interface MenuLinkItem {
+  type: string
+  enabled: boolean
+  order: number
+  label?: string
+  url?: string
+  icon?: string
+}
+
+export async function updateOrgMenuConfig(
+  org_id: string,
+  menu_config: { items: MenuLinkItem[] },
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/config/menu`,
+    RequestBodyWithAuthHeader('PUT', menu_config, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export type SignupFieldType =
+  | 'text'
+  | 'textarea'
+  | 'select'
+  | 'checkbox'
+  | 'number'
+  | 'date'
+
+export interface SignupFieldItem {
+  /** JSON key on the user's extra_metadata. Immutable once created — renaming
+   *  it orphans every answer already collected. */
+  key: string
+  label: string
+  type: SignupFieldType
+  required: boolean
+  enabled: boolean
+  order: number
+  help_text?: string
+  placeholder?: string
+  /** select only — also the server-side allowlist. */
+  options?: string[]
+  max_length?: number | null
+  min_value?: number | null
+  max_value?: number | null
+}
+
+export async function updateOrgSignupFieldsConfig(
+  org_id: string,
+  signup_fields_config: { fields: SignupFieldItem[] },
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/config/signup-fields`,
+    RequestBodyWithAuthHeader('PUT', signup_fields_config, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+/** Read an org's signup fields from its config, handling both config shapes
+ *  (v2 keeps customization under `customization`, v1 under `general`). */
+export function readSignupFields(orgConfig: any): SignupFieldItem[] {
+  const config = orgConfig?.config?.config ?? orgConfig?.config ?? orgConfig
+  const isV2 = String(config?.config_version ?? '1.0').startsWith('2')
+  const section = isV2
+    ? config?.customization?.signup_fields
+    : config?.general?.signup_fields
+  const fields = section?.fields
+  if (!Array.isArray(fields)) return []
+  return [...fields]
+    .filter((f: any) => f && typeof f.key === 'string' && f.key.length > 0)
+    .sort((a: any, b: any) => (a.order ?? 0) - (b.order ?? 0))
+}
+
+export interface SeoOrgConfig {
+  default_meta_title_suffix: string
+  default_meta_description: string
+  default_og_image: string
+  google_site_verification: string
+  twitter_handle: string
+  noindex_communities: boolean
+}
+
+export async function updateOrgSeoConfig(
+  org_id: string,
+  seo_config: SeoOrgConfig,
+  access_token: string
+) {
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/config/seo`,
+    RequestBodyWithAuthHeader('PUT', seo_config, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export async function uploadOrganizationOgImage(
+  org_id: string,
+  og_image_file: File,
+  access_token: string
+) {
+  const formData = new FormData()
+  formData.append('og_image_file', og_image_file)
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/og_image`,
+    RequestBodyFormWithAuthHeader('PUT', formData, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export async function uploadOrgAuthBackground(
+  org_id: string,
+  background_file: File,
+  access_token: string
+) {
+  const formData = new FormData()
+  formData.append('background_file', background_file)
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/auth_background`,
+    RequestBodyFormWithAuthHeader('PUT', formData, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}
+
+export async function uploadOrganizationFavicon(
+  org_id: string,
+  favicon_file: File,
+  access_token: string
+) {
+  const formData = new FormData()
+  formData.append('favicon_file', favicon_file)
+  const result: any = await fetch(
+    `${getAPIUrl()}orgs/${org_id}/favicon`,
+    RequestBodyFormWithAuthHeader('PUT', formData, null, access_token)
+  )
+  const res = await errorHandling(result)
+  return res
+}

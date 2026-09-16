@@ -1,0 +1,266 @@
+'use client'
+
+import React from 'react'
+import { useTranslation } from 'react-i18next'
+
+import { useOrg } from '@components/Contexts/OrgContext'
+import { useResolvedFeature } from '@components/Hooks/useResolvedFeature'
+import { getUpgradeUrl } from '@services/config/config'
+import {
+  FEATURE_METADATA,
+  FeatureKey,
+  getFeatureMeta,
+} from '@services/features/featureMetadata'
+import PlanBadge from '@components/Dashboard/Shared/PlanRestricted/PlanBadge'
+import { useLHAnalytics, useTrackView, AnalyticsEvent } from '@services/analytics'
+
+export interface FeatureGateProps {
+  /** Feature key (drives icon, copy, upsell tier — see featureMetadata.ts). */
+  feature: FeatureKey
+  /**
+   * Org slug for the upgrade deep-link in the plan-locked state. Optional;
+   * falls back to the current org context when omitted.
+   */
+  orgslug?: string
+  /**
+   * Picks the wording of the admin-disabled card — both variants are static,
+   * neither links anywhere.
+   * - 'dashboard': admin context, copy addressed to someone who can flip the
+   *   toggle back on.
+   * - 'public': learner-facing context, plain "not available" message.
+   */
+  context?: 'dashboard' | 'public'
+  /**
+   * Escape hatch for a surface that HOSTS the toggle controlling this very
+   * feature: without it, turning the feature off unmounts its own switch and
+   * the admin is locked out with no way back. Bypasses the admin-disabled card
+   * only — a plan-locked feature still shows the upgrade card.
+   */
+  allowWhenDisabled?: boolean
+  /** Content rendered when the feature is granted. */
+  children: React.ReactNode
+}
+
+const PLAN_GRADIENT: Record<string, string> = {
+  personal: 'from-gray-50/80',
+  family: 'from-gray-50/80',
+  standard: 'from-blue-50/80',
+  pro: 'from-purple-50/80',
+  enterprise: 'from-amber-50/80',
+}
+
+/**
+ * Unified feature gate. Reads resolved_features for the given feature, then:
+ *   - renders children when granted
+ *   - shows the upgrade card when plan is below the requirement
+ *   - shows the admin-disabled card (a dead end, by design) when plan is OK but
+ *     the feature is toggled off
+ *
+ * Replaces the previous PlanRestrictedFeature + FeatureDisabledView nesting.
+ */
+export default function FeatureGate({
+  feature,
+  orgslug,
+  context = 'dashboard',
+  allowWhenDisabled = false,
+  children,
+}: FeatureGateProps) {
+  const { t } = useTranslation()
+  const org = useOrg() as any
+  const state = useResolvedFeature(feature, { allowWhenDisabled })
+  const resolvedSlug = orgslug ?? org?.slug ?? 'default'
+
+  if (!state.reason) {
+    return <>{children}</>
+  }
+
+  if (state.reason === 'disabled') {
+    return (
+      <DisabledCard
+        feature={feature}
+        context={context}
+        t={t}
+      />
+    )
+  }
+
+  return (
+    <UpgradeCard
+      feature={feature}
+      currentPlan={state.currentPlan}
+      orgSlug={resolvedSlug}
+      t={t}
+    />
+  )
+}
+
+function UpgradeCard({
+  feature,
+  currentPlan,
+  orgSlug,
+  t,
+}: {
+  feature: FeatureKey
+  currentPlan: ReturnType<typeof useResolvedFeature>['currentPlan']
+  orgSlug: string
+  t: ReturnType<typeof useTranslation>['t']
+}) {
+  const meta = getFeatureMeta(feature)
+  const Icon = meta.Icon
+  // Deep-link straight to the Confirm step for the plan this feature needs.
+  const upgradeUrl = getUpgradeUrl(orgSlug, meta.upsellPlan)
+  const gradient = PLAN_GRADIENT[meta.upsellPlan] ?? 'from-gray-50/80'
+
+  // Impression: fires once per mount everywhere a feature is gated by plan —
+  // distinguishes "feature locked behind upgrade" across the whole app.
+  const { track } = useLHAnalytics('dashboard')
+  useTrackView(
+    AnalyticsEvent.FeatureGateUpgradeShown,
+    { feature, required_plan: meta.upsellPlan, current_plan: currentPlan },
+    true,
+    'dashboard',
+  )
+
+  const badge = (
+    <PlanBadge
+      currentPlan={currentPlan}
+      requiredPlan={meta.upsellPlan}
+      size="md"
+      alwaysShow
+      noMargin
+    />
+  )
+
+  return (
+    <GateShell variant="upgrade" feature={feature}>
+      <GateCard gradient={gradient}>
+        <IconBubble>
+          <Icon size={32} weight="duotone" className="text-gray-500" />
+        </IconBubble>
+
+        <p className="text-gray-500 max-w-md mx-auto mb-8 leading-relaxed text-sm">
+          {t(meta.descriptionKey)}
+        </p>
+
+        {upgradeUrl ? (
+          <a
+            href={upgradeUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            onClick={() =>
+              track(AnalyticsEvent.FeatureGateUpgradeClicked, {
+                feature,
+                upsell_plan: meta.upsellPlan,
+              })
+            }
+            className="bg-white text-gray-700 px-6 py-2.5 rounded-lg font-semibold hover:bg-gray-50 transition-colors nice-shadow flex items-center gap-2"
+          >
+            <span>{t('common.plans.upgrade_to')}</span>
+            {badge}
+          </a>
+        ) : (
+          <div className="bg-white text-gray-700 px-6 py-2.5 rounded-lg font-semibold nice-shadow flex items-center gap-2">
+            <span>{t('common.plans.upgrade_to')}</span>
+            {badge}
+          </div>
+        )}
+
+        <p className="mt-6 text-xs text-gray-400">
+          {t('common.plans.current_plan')}:{' '}
+          <span className="font-medium text-gray-500 capitalize">{currentPlan}</span>
+        </p>
+      </GateCard>
+    </GateShell>
+  )
+}
+
+function DisabledCard({
+  feature,
+  context,
+  t,
+}: {
+  feature: FeatureKey
+  context: 'dashboard' | 'public'
+  t: ReturnType<typeof useTranslation>['t']
+}) {
+  const meta = getFeatureMeta(feature)
+  const Icon = meta.Icon
+  const featureDisplayName = t(
+    `common.features.disabled.names.${feature}`,
+    t(meta.titleKey)
+  )
+
+  return (
+    <GateShell variant="disabled" feature={feature}>
+      <GateCard gradient="from-gray-50/80">
+        <IconBubble>
+          <Icon size={32} weight="duotone" className="text-gray-500" />
+        </IconBubble>
+
+        <h2 className="text-lg font-semibold text-gray-800 mb-2">
+          {context === 'public'
+            ? t('common.features.disabled.public.title', { feature: featureDisplayName })
+            : t('common.features.disabled.dashboard.title', { feature: featureDisplayName })}
+        </h2>
+
+        <p className="text-gray-500 text-sm mb-6 max-w-sm leading-relaxed">
+          {context === 'public'
+            ? t('common.features.disabled.public.description')
+            : t('common.features.disabled.dashboard.description')}
+        </p>
+
+        <div className="bg-gray-100 text-gray-600 px-4 py-2 rounded-lg text-sm font-medium">
+          {t('common.features.disabled.status')}
+        </div>
+      </GateCard>
+    </GateShell>
+  )
+}
+
+function GateShell({
+  children,
+  variant,
+  feature,
+}: {
+  children: React.ReactNode
+  variant: 'upgrade' | 'disabled'
+  feature: FeatureKey
+}) {
+  return (
+    <div
+      data-feature-gate={variant}
+      data-feature={feature}
+      className="flex items-center justify-center min-h-[60vh] w-full p-6 bg-[#f8f8f8]"
+    >
+      <div className="w-full max-w-lg">{children}</div>
+    </div>
+  )
+}
+
+function GateCard({
+  gradient,
+  children,
+}: {
+  gradient: string
+  children: React.ReactNode
+}) {
+  return (
+    <div className="bg-white rounded-xl nice-shadow overflow-hidden">
+      <div className={`flex flex-col items-center justify-center py-14 px-6 text-center bg-gradient-to-b ${gradient} via-white to-white`}>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+function IconBubble({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="bg-white p-4 rounded-xl nice-shadow mb-6 inline-flex">
+      {children}
+    </div>
+  )
+}
+
+// Re-export so callers can type-check the feature prop.
+export type { FeatureKey }
+export { FEATURE_METADATA }

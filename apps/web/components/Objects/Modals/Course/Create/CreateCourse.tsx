@@ -1,0 +1,391 @@
+'use client'
+import { Input } from "@components/ui/input"
+import { Textarea } from "@components/ui/textarea"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@components/ui/select"
+import FormLayout, {
+  FormField,
+  FormLabelAndMessage,
+} from '@components/Objects/StyledElements/Form/Form'
+import * as Form from '@radix-ui/react-form'
+import { createNewCourse } from '@services/courses/courses'
+import { createChapter } from '@services/courses/chapters'
+import { getOrganizationContextInfoWithoutCredentials } from '@services/organizations/orgs'
+import React, { useEffect } from 'react'
+import { BarLoader } from 'react-spinners'
+import { revalidateTags } from '@services/utils/ts/requests'
+import { useRouter } from 'next/navigation'
+import { useQueryClient } from '@tanstack/react-query'
+import { queryKeys } from '@/lib/query/keys'
+import { useLHSession } from '@components/Contexts/LHSessionContext'
+import toast from 'react-hot-toast'
+import { useFormik } from 'formik'
+import * as Yup from 'yup'
+import {  UploadCloud, Image as ImageIcon, Clipboard } from 'lucide-react'
+import UnsplashImagePicker from "@components/Dashboard/Pages/Course/EditCourseGeneral/UnsplashImagePicker"
+import AIImageButton from '@components/Objects/AI/AIImageButton'
+import FormTagInput from "@components/Objects/StyledElements/Form/TagInput"
+import { useTranslation } from "react-i18next"
+import { useLHAnalytics, AnalyticsEvent } from '@services/analytics'
+import { useUpgradeModal } from '@components/Dashboard/Shared/PlanRestricted/UpgradeModalContext'
+
+const _validationSchema = Yup.object().shape({
+  name: Yup.string()
+    .required('Course name is required')
+    .max(100, 'Must be 100 characters or less'),
+  description: Yup.string()
+    .max(1000, 'Must be 1000 characters or less'),
+  learnings: Yup.string(),
+  tags: Yup.string(),
+  visibility: Yup.boolean(),
+  thumbnail: Yup.mixed().nullable()
+})
+
+function CreateCourseModal({ closeModal, orgslug }: any) {
+  const { t } = useTranslation()
+  const { track } = useLHAnalytics('dashboard')
+  const router = useRouter()
+  const session = useLHSession() as any
+  const queryClient = useQueryClient()
+  const [orgId, setOrgId] = React.useState(null) as any
+  const [showUnsplashPicker, setShowUnsplashPicker] = React.useState(false)
+  const [isUploading, setIsUploading] = React.useState(false)
+  // A free org that hits its course limit gets the shared upgrade paywall.
+  const { handlePlanLimit } = useUpgradeModal()
+
+  const validationSchema = Yup.object().shape({
+    name: Yup.string()
+      .required(t('courses.course_name_required'))
+      .max(100, 'Must be 100 characters or less'),
+    description: Yup.string()
+      .required(t('courses.course_description_required'))
+      .max(1000, 'Must be 1000 characters or less'),
+    learnings: Yup.string(),
+    tags: Yup.string(),
+    visibility: Yup.boolean(),
+    thumbnail: Yup.mixed().nullable()
+  })
+
+  const formik = useFormik({
+    initialValues: {
+      name: '',
+      description: '',
+      learnings: '',
+      visibility: true,
+      tags: '',
+      thumbnail: null
+    },
+    validationSchema,
+    onSubmit: async (values, { setSubmitting }) => {
+      const toast_loading = toast.loading(t('courses.creating_course'))
+
+      try {
+        const res = await createNewCourse(
+          orgId,
+          {
+            name: values.name,
+            description: values.description,
+            learnings: values.learnings,
+            tags: values.tags,
+            visibility: values.visibility
+          },
+          values.thumbnail,
+          session.data?.tokens?.access_token
+        )
+
+        if (res.success) {
+          const thumbnailFile = values.thumbnail as File | null
+          track(AnalyticsEvent.CourseCreated, {
+            thumbnail_source: thumbnailFile
+              ? thumbnailFile.name === 'unsplash_image.jpg'
+                ? 'unsplash'
+                : 'upload'
+              : 'none',
+            visibility: values.visibility ? 'public' : 'private',
+            has_learnings: !!values.learnings?.trim(),
+          })
+          // Create a default first chapter so the new course isn't empty.
+          // Never let a failure here block course creation.
+          try {
+            await createChapter(
+              {
+                name: t('courses.first_chapter_default_name', { defaultValue: 'First Chapter' }),
+                description: '',
+                thumbnail_image: '',
+                course_id: res.data.id,
+                org_id: res.data.org_id ?? orgId,
+              },
+              session.data?.tokens?.access_token
+            )
+          } catch (_chapterError) {
+            // Ignore: the default chapter is a convenience, not a requirement.
+          }
+
+          await revalidateTags(['courses'], orgslug)
+          // Refresh sidebar courses cache
+          queryClient.invalidateQueries({ queryKey: queryKeys.courses.list(orgslug) })
+          toast.dismiss(toast_loading)
+          toast.success(t('courses.course_created_success'))
+
+          closeModal()
+          // Redirect straight to the Content tab and auto-open the "add activity"
+          // popup so a brand-new course lands the teacher on the core creation
+          // action (their first activity) instead of an empty settings page.
+          const courseId = res.data.course_uuid?.replace('course_', '') || res.data.course_uuid
+          router.push(`/dash/courses/course/${courseId}/content?new_activity=1`)
+        } else {
+          toast.dismiss(toast_loading)
+          const detail = typeof res.data?.detail === 'string' ? res.data.detail : ''
+          // A free org that has hit its course limit gets a contextual upgrade
+          // paywall at the moment of value, instead of a dead-end error toast.
+          if (handlePlanLimit(res, { source: 'course_create', feature: 'courses', requiredPlan: 'standard' })) {
+            closeModal()
+          } else {
+            const errorMessage = detail
+              ? detail
+              : Array.isArray(res.data?.detail)
+                ? res.data.detail.map((e: any) => e.msg).join(', ')
+                : t('courses.failed_to_create_course')
+            toast.error(errorMessage)
+          }
+        }
+      } catch (_error) {
+        toast.error(t('courses.failed_to_create_course'))
+      } finally {
+        setSubmitting(false)
+      }
+    }
+  })
+
+  const getOrgMetadata = async () => {
+    const org = await getOrganizationContextInfoWithoutCredentials(orgslug, {
+      revalidate: 360,
+      tags: ['organizations'],
+    })
+    setOrgId(org.id)
+  }
+
+  useEffect(() => {
+    if (orgslug) {
+      getOrgMetadata()
+    }
+  }, [orgslug])
+
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    if (file) {
+      formik.setFieldValue('thumbnail', file)
+    }
+  }
+
+  const handleUnsplashSelect = async (imageUrl: string) => {
+    setIsUploading(true)
+    try {
+      const response = await fetch(imageUrl)
+      const blob = await response.blob()
+      const file = new File([blob], 'unsplash_image.jpg', { type: 'image/jpeg' })
+      formik.setFieldValue('thumbnail', file)
+    } catch (_error) {
+      toast.error('Failed to load image from Unsplash')
+    }
+    setIsUploading(false)
+  }
+
+  const handleAIImageFile = async (file: File) => {
+    formik.setFieldValue('thumbnail', file)
+  }
+
+  const handlePasteFromClipboard = async () => {
+    try {
+      const clipboardItems = await navigator.clipboard.read()
+      for (const clipboardItem of clipboardItems) {
+        const imageTypes = clipboardItem.types.filter(type => type.startsWith('image/'))
+        if (imageTypes.length > 0) {
+          const imageType = imageTypes[0]
+          const blob = await clipboardItem.getType(imageType)
+          // The API derives the stored extension from the filename, so it must
+          // match the blob's actual type (browsers may hand back jpeg/webp/gif).
+          const extensionByType: Record<string, string> = {
+            'image/jpeg': 'jpg',
+            'image/png': 'png',
+            'image/gif': 'gif',
+            'image/webp': 'webp',
+          }
+          const extension = extensionByType[imageType] ?? 'png'
+          const file = new File([blob], `clipboard_image.${extension}`, { type: imageType })
+          formik.setFieldValue('thumbnail', file)
+          return
+        }
+      }
+      toast.error(t('courses.no_image_in_clipboard', { defaultValue: 'No image found in clipboard' }))
+    } catch (_) {
+      toast.error(t('courses.clipboard_read_error', { defaultValue: 'Failed to read from clipboard' }))
+    }
+  }
+
+  return (
+    <FormLayout onSubmit={formik.handleSubmit} >
+      <FormField name="name">
+        <FormLabelAndMessage
+          label={t('courses.course_name')}
+          message={formik.errors.name}
+        />
+        <Form.Control asChild>
+          <Input
+            onChange={formik.handleChange}
+            value={formik.values.name}
+            type="text"
+            required
+          />
+        </Form.Control>
+      </FormField>
+
+      <FormField name="description">
+        <FormLabelAndMessage
+          label={t('library.description')}
+          message={formik.errors.description}
+        />
+        <Form.Control asChild>
+          <Textarea
+            onChange={formik.handleChange}
+            value={formik.values.description}
+            required
+          />
+        </Form.Control>
+      </FormField>
+
+      <FormField name="thumbnail">
+        <FormLabelAndMessage
+          label={t('courses.course_thumbnail')}
+          message={formik.errors.thumbnail}
+        />
+        <div className="w-auto bg-gray-50 rounded-xl outline outline-1 outline-gray-200 h-[200px] shadow-sm">
+          <div className="flex flex-col justify-center items-center h-full">
+            <div className="flex flex-col justify-center items-center">
+              {formik.values.thumbnail ? (
+                <img
+                  src={URL.createObjectURL(formik.values.thumbnail)}
+                  className={`${isUploading ? 'animate-pulse' : ''} shadow-sm w-[200px] h-[100px] rounded-md`}
+                />
+              ) : (
+                <img
+                  src="/empty_thumbnail.png"
+                  className="shadow-sm w-[200px] h-[100px] rounded-md bg-gray-200"
+                />
+              )}
+              <div className="flex justify-center items-center space-x-2">
+                <input
+                  type="file"
+                  id="fileInput"
+                  style={{ display: 'none' }}
+                  onChange={handleFileChange}
+                  accept="image/jpeg,image/png,image/webp,image/gif"
+                />
+                <button
+                  type="button"
+                  className="font-bold antialiased items-center text-gray text-sm rounded-md px-4 mt-6 flex"
+                  onClick={() => document.getElementById('fileInput')?.click()}
+                >
+                  <UploadCloud size={16} className="me-2" />
+                  <span>{t('courses.upload_image')}</span>
+                </button>
+                <button
+                  type="button"
+                  className="font-bold antialiased items-center text-gray text-sm rounded-md px-4 mt-6 flex"
+                  onClick={() => setShowUnsplashPicker(true)}
+                >
+                  <ImageIcon size={16} className="me-2" />
+                  <span>{t('courses.choose_from_gallery')}</span>
+                </button>
+                <button
+                  type="button"
+                  className="font-bold antialiased items-center text-gray text-sm rounded-md px-4 mt-6 flex"
+                  onClick={handlePasteFromClipboard}
+                >
+                  <Clipboard size={16} className="me-2" />
+                  <span>{t('courses.paste_from_clipboard')}</span>
+                </button>
+                <AIImageButton
+                  onSelect={handleUnsplashSelect}
+                  onSelectFile={handleAIImageFile}
+                  className="font-bold antialiased items-center text-gray text-sm rounded-md px-4 mt-6 flex gap-2"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+      </FormField>
+
+			<FormField name="learnings">
+				<FormLabelAndMessage
+					label={t('courses.course_learnings')}
+					message={formik.errors.learnings}
+				/>
+				<FormTagInput
+					placeholder={t('courses.enter_to_add')}
+					value={formik.values.learnings}
+					onChange={(value) => formik.setFieldValue('learnings', value)}
+					error={formik.errors.learnings}
+				/>
+			</FormField>
+
+			<FormField name="tags">
+				<FormLabelAndMessage
+					label={t('courses.course_tags')}
+					message={formik.errors.tags}
+				/>
+				<FormTagInput
+					placeholder={t('courses.enter_to_add')}
+					value={formik.values.tags}
+					onChange={(value) => formik.setFieldValue('tags', value)}
+					error={formik.errors.tags}
+				/>
+			</FormField>
+
+      <FormField name="visibility">
+        <FormLabelAndMessage
+          label={t('courses.course_visibility')}
+          message={formik.errors.visibility}
+        />
+        <Select
+          value={formik.values.visibility.toString()}
+          onValueChange={(value) => formik.setFieldValue('visibility', value === 'true')}
+        >
+          <SelectTrigger>
+            <SelectValue placeholder={t('courses.select_visibility')} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="true">{t('courses.public')} ({t('courses.public_desc')})</SelectItem>
+            <SelectItem value="false">{t('courses.private')} ({t('courses.private_desc')})</SelectItem>
+          </SelectContent>
+        </Select>
+      </FormField>
+
+      <div className="flex justify-end mt-6">
+        <button
+          type="submit"
+          disabled={formik.isSubmitting}
+          className="px-4 py-2 bg-black text-white text-sm font-bold rounded-md"
+        >
+          {formik.isSubmitting ? (
+            <BarLoader
+              cssOverride={{ borderRadius: 60 }}
+              width={60}
+              color="#ffffff"
+            />
+          ) : (
+            t('courses.create_course_btn')
+          )}
+        </button>
+      </div>
+
+      {showUnsplashPicker && (
+        <UnsplashImagePicker
+          onSelect={handleUnsplashSelect}
+          onClose={() => setShowUnsplashPicker(false)}
+        />
+      )}
+    </FormLayout>
+  )
+}
+
+export default CreateCourseModal

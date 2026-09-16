@@ -1,0 +1,499 @@
+'use client'
+import { useAssignments } from '@components/Contexts/Assignments/AssignmentContext'
+import { useAssignmentSubmission } from '@components/Contexts/Assignments/AssignmentSubmissionContext'
+import {
+  useAssignmentsTask,
+  useAssignmentsTaskDispatch,
+} from '@components/Contexts/Assignments/AssignmentsTaskContext'
+import { useLHSession } from '@components/Contexts/LHSessionContext'
+import AssignmentBoxUI from '@components/Objects/Activities/Assignment/AssignmentBoxUI'
+import {
+  getAssignmentTask,
+  getAssignmentTaskSubmissionsMe,
+  getAssignmentTaskSubmissionsUser,
+  handleAssignmentTaskSubmission,
+  updateAssignmentTask,
+} from '@services/courses/assignments'
+import { CheckCircle2, XCircle } from 'lucide-react'
+import React, { useEffect, useState } from 'react'
+import toast from 'react-hot-toast'
+import { useTranslation } from 'react-i18next'
+import { useQueryClient } from '@tanstack/react-query'
+import { queryKeys } from '@/lib/query/keys'
+import { applyManualGrade } from './applyManualGrade'
+
+type NumberAnswerContents = {
+  prompt: string
+  correct_value: number
+  tolerance: number      // absolute ± tolerance in the same units as correct_value
+  unit?: string          // optional display unit like "m/s²" or "kg"
+  explanation?: string
+}
+
+type TaskNumberAnswerObjectProps = {
+  view: 'teacher' | 'student' | 'grading'
+  assignmentTaskUUID?: string
+  user_id?: string
+  onGraded?: () => void
+}
+
+const DEFAULT_CONTENTS: NumberAnswerContents = {
+  prompt: '',
+  correct_value: 0,
+  tolerance: 0,
+  unit: '',
+  explanation: '',
+}
+
+// NOTE: numeric grading runs server-side via _check_number_answer in
+// assignments.py. The student's answer is stored as-is on save; the backend
+// re-parses and compares against correct_value ± tolerance during finalize.
+
+function normalizeContents(raw: any): NumberAnswerContents {
+  return {
+    prompt: raw?.prompt ?? '',
+    correct_value: Number.isFinite(raw?.correct_value) ? raw.correct_value : 0,
+    tolerance: Number.isFinite(raw?.tolerance) ? raw.tolerance : 0,
+    unit: raw?.unit ?? '',
+    explanation: raw?.explanation ?? '',
+  }
+}
+
+// Did the answer key actually reach the client?
+//
+// The API strips `correct_value` from the task payload whenever the student
+// isn't allowed to see it yet — notably while retry attempts remain (see
+// _student_may_see_answer_key; max_retries=0 means unlimited, so it never
+// reveals). The client can't re-derive that rule (it has no attempt_number
+// here), so `showCorrectAnswers` can be true while the key is absent. In that
+// state normalizeContents defaults correct_value to 0 and the reveal panel
+// would confidently claim "Accepted range: 0 ± tolerance" to a learner who
+// answered correctly. Capture presence from the RAW payload, before defaults.
+function hasAnswerKey(raw: any): boolean {
+  return typeof raw?.correct_value === 'number' && Number.isFinite(raw.correct_value)
+}
+
+function TaskNumberAnswerObject({
+  view,
+  assignmentTaskUUID,
+  user_id,
+  onGraded,
+}: TaskNumberAnswerObjectProps) {
+  const { t } = useTranslation()
+  const session = useLHSession() as any
+  const access_token = session?.data?.tokens?.access_token
+  const assignmentTaskState = useAssignmentsTask() as any
+  const assignmentTaskStateHook = useAssignmentsTaskDispatch() as any
+  const assignment = useAssignments() as any
+  const queryClient = useQueryClient()
+  // Same reveal gate as the other task types: teacher must opt in, and the
+  // submission must already be GRADED before any correct-answer hint appears.
+  const assignmentSubmission = useAssignmentSubmission() as any
+  const submissionIsGraded = Array.isArray(assignmentSubmission)
+    && assignmentSubmission.length > 0
+    && assignmentSubmission[0].submission_status === 'GRADED'
+  const showCorrectAnswers = view === 'student'
+    && submissionIsGraded
+    && !!assignment?.assignment_object?.show_correct_answers
+
+  const [contents, setContents] = useState<NumberAnswerContents>(DEFAULT_CONTENTS)
+  // Tracks whether the server actually sent the answer key (see hasAnswerKey).
+  const [answerKeyPresent, setAnswerKeyPresent] = useState(false)
+  // The server applies a third reveal condition the client can't reproduce, so
+  // the opt-in gate alone isn't enough — only reveal when the key is really here.
+  const revealAnswerKey = showCorrectAnswers && answerKeyPresent
+  const [studentAnswer, setStudentAnswer] = useState<string>('')
+  const [initialAnswer, setInitialAnswer] = useState<string>('')
+  // Tracks whether the student has typed in the input; once true, we stop
+  // re-hydrating from the server so their draft isn't clobbered mid-edit.
+  const interactedRef = React.useRef(false)
+
+  const [userSubmissions, setUserSubmissions] = useState<any>(null)
+  const [userSubmissionObject, setUserSubmissionObject] = useState<any>(null)
+  const [assignmentTaskOutsideProvider, setAssignmentTaskOutsideProvider] =
+    useState<any>(null)
+
+  // --- TEACHER VIEW ---
+  useEffect(() => {
+    if (view === 'teacher' && assignmentTaskState?.assignmentTask?.contents) {
+      const c = assignmentTaskState.assignmentTask.contents
+      if (c.prompt !== undefined || c.correct_value !== undefined) {
+        /* eslint-disable react-hooks/set-state-in-effect */
+        setContents(normalizeContents(c))
+        setAnswerKeyPresent(hasAnswerKey(c))
+        /* eslint-enable react-hooks/set-state-in-effect */
+      }
+    }
+  }, [view, assignmentTaskState])
+
+  // --- STUDENT / GRADING VIEW ---
+  async function loadTaskDefinition() {
+    if (!assignmentTaskUUID) return
+    const res = await getAssignmentTask(assignmentTaskUUID, access_token)
+    if (res.success) {
+      setAssignmentTaskOutsideProvider(res.data)
+      if (res.data.contents) {
+        setContents(normalizeContents(res.data.contents))
+        setAnswerKeyPresent(hasAnswerKey(res.data.contents))
+      }
+    }
+  }
+
+  async function loadOwnSubmission() {
+    if (!assignmentTaskUUID) return
+    const res = await getAssignmentTaskSubmissionsMe(
+      assignmentTaskUUID,
+      assignment.assignment_object.assignment_uuid,
+      access_token
+    )
+    if (res.success && res.data) {
+      setUserSubmissions(res.data)
+      const saved = String(res.data.task_submission?.answer ?? '')
+      // The interaction guard has to be checked HERE, after the await — not
+      // before it. If the learner starts typing during the round trip, a
+      // pre-await check still lets the late response overwrite their text AND
+      // reset the dirty baseline, so auto-save never fires and the answer is
+      // silently lost at submit time. Always adopt the submission row + the
+      // saved baseline (a save must target the right row, and the baseline is
+      // what makes the draft look dirty), but keep their in-progress text.
+      setInitialAnswer(saved)
+      if (!interactedRef.current) {
+        setStudentAnswer(saved)
+      }
+    }
+  }
+
+  async function loadUserSubmission() {
+    if (!assignmentTaskUUID || !user_id) return
+    const res = await getAssignmentTaskSubmissionsUser(
+      assignmentTaskUUID,
+      user_id,
+      assignment.assignment_object.assignment_uuid,
+      access_token
+    )
+    if (res.success && res.data) {
+      setUserSubmissions(res.data)
+      setUserSubmissionObject(res.data)
+      const saved = res.data.task_submission?.answer ?? ''
+      setStudentAnswer(String(saved))
+      setInitialAnswer(String(saved))
+    }
+  }
+
+  useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect */
+    if (view === 'student') {
+      loadTaskDefinition()
+      loadOwnSubmission()
+    } else if (view === 'grading') {
+      loadTaskDefinition()
+      loadUserSubmission()
+    }
+    /* eslint-enable react-hooks/set-state-in-effect */
+  }, [view, assignmentTaskUUID, assignment, access_token])
+
+  // --- SAVE (teacher) ---
+  async function saveFC() {
+    if (!assignmentTaskState?.assignmentTask?.assignment_task_uuid) return
+    const res = await updateAssignmentTask(
+      { contents },
+      assignmentTaskState.assignmentTask.assignment_task_uuid,
+      assignment.assignment_object.assignment_uuid,
+      access_token
+    )
+    if (res.success) {
+      assignmentTaskStateHook({ type: 'reload' })
+      toast.success(t('dashboard.assignments.editor.toasts.task_updated'))
+    } else {
+      toast.error(t('dashboard.assignments.editor.toasts.task_update_error'))
+    }
+  }
+
+  // --- SAVE PROGRESS (student) ---
+  // Matches the QUIZ / FORM pattern: persist the draft answer only. Grading
+  // is done server-side via _server_verified_task_grade when the assignment
+  // is finalized — either by the auto-grade path on submission or by the
+  // teacher clicking "Set final grade". Keeping the client out of the
+  // grading loop also means DevTools tampering can't inflate the score.
+  async function submitFC(opts?: { silent?: boolean }) {
+    if (!assignmentTaskUUID) return true
+    const values = {
+      assignment_task_submission_uuid:
+        userSubmissions?.assignment_task_submission_uuid || null,
+      task_submission: {
+        answer: studentAnswer,
+      },
+      grade: 0,
+      task_submission_grade_feedback: '',
+    }
+    const res = await handleAssignmentTaskSubmission(
+      values,
+      assignmentTaskUUID,
+      assignment.assignment_object.assignment_uuid,
+      access_token
+    )
+    if (res.success) {
+      setUserSubmissions(res.data)
+      setInitialAnswer(studentAnswer)
+      // Keep the shared batch task-submissions cache in step with what we just
+      // persisted. It has a 60s staleTime, so without this a remount re-hydrates
+      // the page-load snapshot and overwrites answers the learner already saved.
+      // Patching (rather than invalidating) avoids a refetch on every ~1s
+      // silent auto-save.
+      const taskUUID = assignmentTaskUUID
+      queryClient.setQueryData(
+        queryKeys.assignments.taskSubmission(assignment.assignment_object.assignment_uuid),
+        (prev: any) => (prev ? { ...prev, [taskUUID]: res.data } : prev)
+      )
+      if (!opts?.silent) toast.success(t('dashboard.assignments.editor.toasts.task_saved'))
+      return true
+    } else {
+      if (!opts?.silent) toast.error(t('dashboard.assignments.editor.toasts.task_save_error'))
+      return false
+    }
+  }
+
+  const gradedPassed = userSubmissionObject?.grade > 0
+
+  // For display in grading view: e.g. "9.81 ± 0.05 m/s²"
+  const acceptedRange =
+    contents.tolerance > 0
+      ? `${contents.correct_value} ± ${contents.tolerance}${contents.unit ? ' ' + contents.unit : ''}`
+      : `${contents.correct_value}${contents.unit ? ' ' + contents.unit : ''}`
+
+  async function gradeCustomFC(grade: number, feedback?: string) {
+    if (!userSubmissions) return
+    await applyManualGrade({
+      grade,
+      feedback,
+      maxPoints:
+        assignmentTaskOutsideProvider?.max_grade_value ||
+        assignmentTaskState?.assignmentTask?.max_grade_value ||
+        100,
+      assignmentTaskUUID,
+      assignmentUUID: assignment.assignment_object.assignment_uuid,
+      accessToken: access_token,
+      username: session?.data?.user?.username,
+      assignmentTaskSubmissionUUID: userSubmissions.assignment_task_submission_uuid,
+      taskSubmissionPayload: userSubmissions.task_submission,
+      onSuccess: () => { loadUserSubmission(); onGraded?.(); },
+    })
+  }
+
+  return (
+    <AssignmentBoxUI
+      type="form"
+      view={view}
+      saveFC={saveFC}
+      submitFC={submitFC}
+      taskUUID={assignmentTaskUUID}
+      gradeCustomFC={gradeCustomFC}
+      currentPoints={userSubmissionObject?.grade}
+      currentFeedback={userSubmissionObject?.task_submission_grade_feedback}
+      maxPoints={
+        assignmentTaskOutsideProvider?.max_grade_value ||
+        assignmentTaskState?.assignmentTask?.max_grade_value
+      }
+      dirtyValue={studentAnswer}
+      savedValue={initialAnswer}
+    >
+      <div className="flex flex-col space-y-4">
+        {/* === TEACHER VIEW === */}
+        {view === 'teacher' && (
+          <>
+            <div className="flex flex-col space-y-1">
+              <label className="text-xs font-semibold text-slate-500">
+                {t('dashboard.assignments.editor.task_editor.number_answer.prompt_label')}
+              </label>
+              <textarea
+                value={contents.prompt}
+                onChange={(e) =>
+                  setContents((prev) => ({ ...prev, prompt: e.target.value }))
+                }
+                placeholder={t(
+                  'dashboard.assignments.editor.task_editor.number_answer.prompt_placeholder'
+                )}
+                rows={2}
+                className="px-3 py-2 text-sm border border-gray-200 rounded-md bg-white resize-y"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div className="flex flex-col space-y-1">
+                <label className="text-xs font-semibold text-slate-500">
+                  {t('dashboard.assignments.editor.task_editor.number_answer.correct_value_label')}
+                </label>
+                <input
+                  type="number"
+                  step="any"
+                  value={contents.correct_value}
+                  onChange={(e) =>
+                    setContents((prev) => ({
+                      ...prev,
+                      correct_value: Number.parseFloat(e.target.value) || 0,
+                    }))
+                  }
+                  className="px-3 py-1.5 text-sm border border-gray-200 rounded-md bg-white"
+                />
+              </div>
+              <div className="flex flex-col space-y-1">
+                <label className="text-xs font-semibold text-slate-500">
+                  {t('dashboard.assignments.editor.task_editor.number_answer.tolerance_label')}
+                </label>
+                <input
+                  type="number"
+                  step="any"
+                  min={0}
+                  value={contents.tolerance}
+                  onChange={(e) =>
+                    setContents((prev) => ({
+                      ...prev,
+                      tolerance: Math.max(0, Number.parseFloat(e.target.value) || 0),
+                    }))
+                  }
+                  className="px-3 py-1.5 text-sm border border-gray-200 rounded-md bg-white"
+                />
+              </div>
+            </div>
+
+            <div className="flex flex-col space-y-1">
+              <label className="text-xs font-semibold text-slate-500">
+                {t('dashboard.assignments.editor.task_editor.number_answer.unit_label')}
+              </label>
+              <input
+                value={contents.unit ?? ''}
+                onChange={(e) =>
+                  setContents((prev) => ({ ...prev, unit: e.target.value }))
+                }
+                placeholder={t(
+                  'dashboard.assignments.editor.task_editor.number_answer.unit_placeholder'
+                )}
+                className="px-3 py-1.5 text-sm border border-gray-200 rounded-md bg-white"
+              />
+              <p className="text-[10px] text-slate-400">
+                {t('dashboard.assignments.editor.task_editor.number_answer.unit_hint')}
+              </p>
+            </div>
+
+            <div className="flex flex-col space-y-1">
+              <label className="text-xs font-semibold text-slate-500">
+                {t('dashboard.assignments.editor.task_editor.number_answer.explanation_label')}
+              </label>
+              <textarea
+                value={contents.explanation ?? ''}
+                onChange={(e) =>
+                  setContents((prev) => ({ ...prev, explanation: e.target.value }))
+                }
+                placeholder={t(
+                  'dashboard.assignments.editor.task_editor.number_answer.explanation_placeholder'
+                )}
+                rows={2}
+                className="px-3 py-2 text-sm border border-gray-200 rounded-md bg-white resize-y"
+              />
+            </div>
+
+            <div className="flex items-center space-x-1.5 text-[11px] text-slate-500 bg-slate-50 rounded-md px-2.5 py-1.5">
+              <span>{t('dashboard.assignments.editor.task_editor.number_answer.preview_label')}:</span>
+              <span className="font-mono font-semibold text-slate-700">
+                {acceptedRange}
+              </span>
+            </div>
+          </>
+        )}
+
+        {/* === STUDENT VIEW === */}
+        {/* Saving is just persisting a draft — no Correct/Incorrect feedback
+            here. The student sees their grade after the whole assignment is
+            graded (visible in the activity header badge). */}
+        {view === 'student' && (
+          <>
+            {contents.prompt && (
+              <p className="text-sm text-slate-700 whitespace-pre-wrap">{contents.prompt}</p>
+            )}
+            <div className="flex items-center space-x-2">
+              <input
+                type="text"
+                inputMode="decimal"
+                value={studentAnswer}
+                onChange={(e) => { if (!submissionIsGraded) { interactedRef.current = true; setStudentAnswer(e.target.value) } }}
+                readOnly={submissionIsGraded}
+                placeholder={t(
+                  'dashboard.assignments.editor.task_editor.number_answer.your_answer_placeholder'
+                )}
+                className="w-full max-w-[200px] px-3 py-2 text-sm border-2 border-gray-200 rounded-md bg-white focus:border-blue-400 focus:ring-2 focus:ring-blue-200 outline-none font-mono"
+              />
+              {contents.unit && (
+                <span className="text-sm font-medium text-slate-500">{contents.unit}</span>
+              )}
+            </div>
+            {/* No answer-key panel at all when the key was withheld — the
+                learner still sees their own answer and their score. A
+                fabricated "Accepted range: 0" would be worse than nothing. */}
+            {revealAnswerKey && (
+              <div className="flex flex-col space-y-1.5 p-3 rounded-md bg-emerald-50 border border-emerald-200">
+                <div className="flex items-center space-x-1.5 text-xs font-semibold text-emerald-700">
+                  <CheckCircle2 size={13} />
+                  <span>{t('dashboard.assignments.editor.task_editor.number_answer.accepted_range_label')}</span>
+                </div>
+                <div className="text-sm font-mono text-emerald-800">{acceptedRange}</div>
+                {contents.explanation && (
+                  <p className="text-xs text-emerald-800/80 mt-1 whitespace-pre-wrap">{contents.explanation}</p>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        {/* === GRADING VIEW === */}
+        {view === 'grading' && (
+          <>
+            {contents.prompt && (
+              <p className="text-sm text-slate-700 whitespace-pre-wrap">{contents.prompt}</p>
+            )}
+            <div className="flex flex-col space-y-1">
+              <label className="text-xs font-semibold text-slate-500">
+                {t('dashboard.assignments.editor.task_editor.number_answer.student_answer_label')}
+              </label>
+              <div className="px-3 py-2 text-sm bg-gray-50 border border-gray-200 rounded-md font-mono">
+                {studentAnswer ? (
+                  <>
+                    {studentAnswer}
+                    {contents.unit && <span className="text-slate-500 ms-1.5 font-sans">{contents.unit}</span>}
+                  </>
+                ) : (
+                  <span className="text-gray-400 italic font-sans">
+                    {t('dashboard.assignments.editor.task_editor.number_answer.no_answer')}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="flex flex-col space-y-1">
+              <label className="text-xs font-semibold text-slate-500">
+                {t('dashboard.assignments.editor.task_editor.number_answer.accepted_range_label')}
+              </label>
+              <div className="px-3 py-2 text-sm bg-emerald-50 border border-emerald-200 rounded-md font-mono text-emerald-700">
+                {acceptedRange}
+              </div>
+            </div>
+            <div
+              className={`flex items-center space-x-2 p-2.5 rounded-md text-xs font-semibold ${
+                gradedPassed
+                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                  : 'bg-rose-50 text-rose-700 border border-rose-200'
+              }`}
+            >
+              {gradedPassed ? <CheckCircle2 size={14} /> : <XCircle size={14} />}
+              <span>
+                {gradedPassed
+                  ? t('dashboard.assignments.editor.task_editor.number_answer.correct')
+                  : t('dashboard.assignments.editor.task_editor.number_answer.incorrect')}
+              </span>
+            </div>
+          </>
+        )}
+      </div>
+    </AssignmentBoxUI>
+  )
+}
+
+export default TaskNumberAnswerObject
