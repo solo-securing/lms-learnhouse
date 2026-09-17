@@ -90,6 +90,7 @@ function NewActivityButton(props: NewActivityButtonProps) {
     // modal closes immediately and the teacher can keep working.
     if (type === 'video') {
       setNewActivityModal(false)
+      const isGDrive = activity?.storage === 'gdrive'
       const taskId = addTask({
         kind: 'video-upload',
         title: activity?.name || 'Video',
@@ -101,10 +102,23 @@ function NewActivityButton(props: NewActivityButtonProps) {
           activity,
           chapterId,
           access_token,
-          (pct) => updateTask(taskId, { progress: pct })
+          (pct) => updateTask(taskId, { progress: pct }),
+          () => {
+            // The browser is done sending. For Drive the server now relays the
+            // file to Google, which can take a while — show that without a
+            // percentage until the response arrives.
+            if (isGDrive) {
+              updateTask(taskId, {
+                status: 'processing',
+                indeterminate: true,
+                subtitle: t('activities.video_gdrive.uploading_to_drive'),
+              })
+            }
+          }
         )
         updateTask(taskId, { status: 'processing', subtitle: 'Finishing up…', progress: 100 })
-        if (captions && created?.activity_uuid) {
+        // Captions are a server-hosted feature; a Drive video has no transcode.
+        if (!isGDrive && captions && created?.activity_uuid) {
           try {
             await updateVideoCaptions(created.activity_uuid, captions, access_token)
           } catch {

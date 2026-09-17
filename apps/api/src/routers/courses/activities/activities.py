@@ -23,6 +23,8 @@ from src.services.courses.activities.versioning import (
     restore_activity_version,
 )
 from src.security.auth import get_current_user
+from src.services.integrations.gdrive.errors import GDriveError, to_http_exception
+from src.services.integrations.gdrive.readiness import require_ready
 from src.services.courses.activities.pdf import (
     create_documentpdf_activity,
     update_documentpdf_activity,
@@ -410,13 +412,26 @@ async def api_create_video_activity(
     chapter_id: int = Form(),
     details: str = Form(default="{}"),
     extra_metadata: Optional[str] = Form(default=None),
+    storage: str = Form(default="server"),
     current_user: PublicUser = Depends(get_current_user),
     video_file: UploadFile | None = None,
     db_session=Depends(get_db_session),
 ) -> ActivityRead:
     """
-    Create new activity
+    Create new activity.
+
+    ``storage`` selects where the file lives: ``server`` (default, unchanged
+    behaviour) or ``gdrive`` (the operator's Google Drive; requires the
+    integration to be ready, otherwise 409 before the upload is touched).
     """
+    storage_value = (storage or "server").strip().lower()
+    if storage_value not in ("server", "gdrive"):
+        raise HTTPException(status_code=422, detail="storage must be 'server' or 'gdrive'")
+    if storage_value == "gdrive":
+        try:
+            await require_ready()
+        except GDriveError as err:
+            raise to_http_exception(err)
     return await create_video_activity(
         request,
         name,
@@ -426,6 +441,7 @@ async def api_create_video_activity(
         video_file,
         _validate_details(details),
         extra_metadata=_parse_extra_metadata(extra_metadata),
+        storage=storage_value,
     )
 
 

@@ -1,10 +1,14 @@
 import React from 'react'
 import YouTube from 'react-youtube'
+import { useTranslation } from 'react-i18next'
 import { useOrg } from '@components/Contexts/OrgContext'
 import LearnHousePlayer from './LearnHousePlayer'
 import {
+  DRIVE_OVERLAY_HEIGHT_PX,
   isActivityHlsReady,
+  isGDriveActivity,
   resolveActivityVideoSource,
+  resolveDrivePreviewUrl,
   resolveHlsThumbnails,
   resolveActivityCaptions,
 } from './videoSource'
@@ -23,6 +27,10 @@ interface VideoActivityProps {
     content: {
       filename?: string
       uri?: string
+      // Google Drive-stored videos (SUBTYPE_VIDEO_GDRIVE)
+      gdrive_file_id?: string
+      original_filename?: string
+      storage?: string
     }
     details?: VideoDetails
     extra_metadata?: {
@@ -50,9 +58,18 @@ interface VideoActivityProps {
 }
 
 function VideoActivity({ activity, course, orgUuid }: VideoActivityProps) {
+  const { t } = useTranslation()
   const org = useOrg() as any
   const resolvedOrgUuid = orgUuid || org?.org_uuid
   const [videoId, setVideoId] = React.useState('')
+
+  // A Drive-stored video plays through Google's own embed: no HLS, no player,
+  // no captions. The embed URL is built in exactly one place and is only ever
+  // used as the iframe source.
+  const isGDrive = isGDriveActivity(activity)
+  const drivePreviewUrl = isGDrive
+    ? resolveDrivePreviewUrl(activity?.content?.gdrive_file_id)
+    : null
 
   React.useEffect(() => {
     if (activity?.content?.uri) {
@@ -78,6 +95,37 @@ function VideoActivity({ activity, course, orgUuid }: VideoActivityProps) {
     <div className="w-full max-w-full px-0 sm:px-4">
       {activity && (
         <>
+          {isGDrive && (
+            <div className="my-0 sm:my-3 md:my-5 w-full">
+              <div className="relative w-full aspect-video sm:rounded-lg overflow-hidden ring-0 sm:ring-1 sm:ring-gray-200/10 sm:dark:ring-gray-700/20 shadow-none">
+                {drivePreviewUrl ? (
+                  <>
+                    <iframe
+                      src={drivePreviewUrl}
+                      title={t('activities.video_gdrive.label')}
+                      className="absolute inset-0 w-full h-full border-0"
+                      sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
+                      allowFullScreen
+                      referrerPolicy="no-referrer"
+                      allow="fullscreen"
+                    />
+                    {/* Transparent strip stacked above the embed's top bar so
+                        its open/share affordances can't be clicked. It must
+                        stay a normal div (no pointer-events:none). */}
+                    <div
+                      aria-hidden="true"
+                      tabIndex={-1}
+                      className="absolute inset-x-0 top-0 z-10"
+                      style={{ height: DRIVE_OVERLAY_HEIGHT_PX }}
+                    />
+                  </>
+                ) : null}
+              </div>
+              <p className="mt-2 text-xs text-gray-500">
+                {t('activities.video_gdrive.embed_hint')}
+              </p>
+            </div>
+          )}
           {activity.activity_sub_type === 'SUBTYPE_VIDEO_HOSTED' && (
             <div className="my-0 sm:my-3 md:my-5 w-full">
               <div className="relative w-full aspect-video sm:rounded-lg overflow-hidden ring-0 sm:ring-1 sm:ring-gray-200/10 sm:dark:ring-gray-700/20 shadow-none">

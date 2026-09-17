@@ -99,3 +99,27 @@ jobs:
       - name: Type check
         run: bunx tsc --noEmit
         working-directory: ./apps/web
+
+  # Unit tests for apps/web (pure-function .test.mjs files under tests/). This
+  # is the first workflow to execute them (Constitution I: every app that ships
+  # source code has a CI job that runs its tests); the exit code is NOT
+  # swallowed, so a failing test blocks the PR.
+  web-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+      - name: Cache bun install cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: bun-web-${{ runner.os }}-${{ hashFiles('apps/web/bun.lock') }}
+          restore-keys: bun-web-${{ runner.os }}-
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+        working-directory: ./apps/web
+      - name: Unit tests
+        run: bun test tests
+        working-directory: ./apps/web

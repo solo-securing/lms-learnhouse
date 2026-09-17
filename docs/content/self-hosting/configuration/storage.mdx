@@ -65,3 +65,61 @@ LEARNHOUSE_CONTENT_DELIVERY_TYPE=s3api
 LEARNHOUSE_S3_API_BUCKET_NAME=learnhouse-content
 LEARNHOUSE_S3_API_ENDPOINT_URL=http://minio:9000
 ```
+
+## Google Drive for video activities
+
+Independently of the content backend above, LearnHouse can keep the file of a **video activity** on the operator's personal Google Drive. When the integration is ready, the "Add activity → Video → Upload" dialog offers a *Storage location* choice (Google Drive is preselected); the server receives the file, relays it to Drive inside the same request, shares it as "anyone with the link can view" with downloading/printing/copying disabled, and learners watch it through an embedded Drive player. When the integration is off or not ready the choice is simply not shown and everything behaves as before.
+
+The feature is opt-in per instance and needs a one-time authorization by the operator.
+
+### 1. Google Cloud Console (once)
+
+1. Create (or reuse) an OAuth client of type **Web application**. Add `http://localhost:8765/` to **Authorized redirect URIs** (use another port if you pass `--port` below).
+2. Enable the **Google Drive API** for the project.
+3. On the **OAuth consent screen**, add the scope `https://www.googleapis.com/auth/drive.file` and set **Publishing status → In production**. In the *Testing* state Google expires the refresh token after 7 days and you would have to re-authorize every week.
+4. Download the client JSON and place it on the server outside the repository, e.g. `/srv/learnhouse/secrets/gdrive-client.json`.
+5. Do **not** create the root folder on Drive yourself. The `drive.file` scope only lets the app see folders it created, so a hand-made "LearnHouse" folder would be ignored and a second one created.
+
+### 2. Configure and authorize
+
+```env
+LEARNHOUSE_GDRIVE_ENABLED=true
+LEARNHOUSE_GDRIVE_CREDENTIALS_PATH=/srv/learnhouse/secrets/gdrive-client.json
+LEARNHOUSE_GDRIVE_TOKEN_PATH=/srv/learnhouse/secrets/gdrive_token.json
+LEARNHOUSE_GDRIVE_ROOT_FOLDER_NAME=LearnHouse
+```
+
+Then run the consent flow once and check the result:
+
+```bash
+cd apps/api
+uv run python cli.py gdrive-authorize          # opens a browser, sign in, accept
+uv run python cli.py gdrive-status             # expect: ready: true, account: <email>, exit code 0
+```
+
+`gdrive-authorize` works even while `LEARNHOUSE_GDRIVE_ENABLED=false`, so you can prepare the token before turning the feature on. The running API picks up a new token file automatically (it watches the file's modification time) — no restart needed.
+
+**Headless server**: run `uv run python cli.py gdrive-authorize --no-browser`, forward the loopback port from a machine with a browser (`ssh -L 8765:localhost:8765 <host>`), open the printed URL there and complete the consent. Alternatively run the command on your laptop and copy the resulting token file to the server, keeping mode `0600`.
+
+**File permissions**: both files are secrets. The token file is written with mode `0600` automatically; the OAuth client JSON you download from Google Cloud Console is not, so restrict it yourself (`chmod 600 /path/to/credentials.json`, or `0400` since LearnHouse only reads it) and make sure it is owned by the user the API runs as. Neither file belongs in git or in a Docker image — reference them by path only.
+
+**Re-authorization**: if `gdrive-status` reports `reason: needs_reauthorization` (token revoked, or expired because the consent screen was left in *Testing*), run `gdrive-authorize` again. Until then, creating, editing, replacing or deleting Drive video activities is refused with an explanatory error; learners can still watch existing videos.
+
+### 3. Sizing and proxies
+
+- **Temporary disk**: the upload is spooled to disk twice on its way to Drive (once by nginx, once by the API), so keep at least **2× the largest video** (up to 2 × 5 GiB) free on the temporary partition.
+- **Proxy timeouts**: the whole upload to Drive happens inside one HTTP request. The bundled nginx already allows 24 hours for `/api/v1`; any reverse proxy or load balancer you put in front must allow **at least 24 hours** of read/send timeout on that route.
+- **Cloudflare (and similar proxies)** enforce a ~100 second time-to-first-byte and are **not supported** in front of this route.
+- **Quota**: Drive counts the videos against the operator account's storage, and Google limits uploads to roughly 750 GB per account per day.
+- **Processing time**: after the upload finishes, Google Drive still transcodes the video on its side. Large files can take several minutes before the embedded player is able to play them; the activity already exists and there is no intermediate state to wait for, so just open it again a little later.
+
+### 4. Cleaning up on Drive
+
+Files are laid out as `<root folder>/<org uuid>/<course uuid>/<activity uuid>/video.<ext>`. Replacing a video, deleting an activity or deleting a course removes the corresponding file/folder on a best-effort basis. Whenever that fails (Drive unreachable, quota, token revoked) the API logs a `WARNING` naming the Drive file or folder id — delete it by hand from Drive. Two cases are always manual:
+
+- deleting an **organization** removes the database rows only; delete `<root folder>/<org uuid>` yourself;
+- a **cloned course** shares the Drive files of the original; when either copy is deleted the shared folder is kept and a warning is logged, so remove it once both are gone.
+
+### 5. Keep an eye on the embed
+
+Learners see the Drive preview player inside a sandboxed iframe with a transparent strip over its top edge so the "open in new tab" button cannot be used, and pop-ups/top-navigation are disabled by the sandbox. Google occasionally changes that player's layout. After every LearnHouse upgrade, and at least once a quarter, open a Drive video activity as a learner and check that the top-right button of the player still cannot be clicked. If it can, report it so the strip height (`DRIVE_OVERLAY_HEIGHT_PX`) can be adjusted.

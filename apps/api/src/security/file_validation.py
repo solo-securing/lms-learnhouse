@@ -311,24 +311,19 @@ MIME_TO_SAFE_EXT = {
 }
 
 
-def validate_upload(
+def _validate_upload_common(
     file: UploadFile,
     allowed_types: List[str],
-    max_size: Optional[int] = None
-) -> Tuple[str, bytes]:
-    """
-    Validate uploaded file for security and type compliance.
-    
-    Args:
-        file: The uploaded file
-        allowed_types: List of allowed file types ('image', 'video', 'document')
-        max_size: Maximum file size in bytes (auto-determined if None)
-        
-    Returns:
-        Tuple of (mime_type, file_content)
-        
-    Raises:
-        HTTPException: If validation fails
+    max_size: Optional[int] = None,
+) -> Tuple[str, Optional[bytes], Optional[int]]:
+    """Shared head of :func:`validate_upload` / :func:`validate_upload_stream`.
+
+    Runs the extension / SVG / size / magic-byte checks without ever pulling the
+    whole body into memory, and leaves the stream rewound to 0.
+
+    Returns ``(canonical_mime, buffered, size)``: ``buffered`` is the bounded
+    read that was needed only for a stream that could not be measured by
+    seeking (``None`` otherwise); ``size`` is the measured length when known.
     """
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="No file provided")
@@ -357,8 +352,9 @@ def validate_upload(
     # previous behaviour) let an oversized upload allocate its full size in RAM
     # before the limit was ever consulted.
     buffered: Optional[bytes] = None
+    declared_size = getattr(file, 'size', None)
+    stream_size: Optional[int] = None
     if size_limit:
-        declared_size = getattr(file, 'size', None)
         stream_size = _stream_length(file.file)
         for measured in (declared_size, stream_size):
             if isinstance(measured, int) and measured > size_limit:
@@ -394,13 +390,70 @@ def validate_upload(
     if not valid:
         raise HTTPException(status_code=415, detail="File appears to be corrupted or invalid")
 
+    canonical_type = EXT_TO_CANONICAL_MIME.get(ext, file.content_type)
+    size: Optional[int]
+    if buffered is not None:
+        size = len(buffered)
+    elif isinstance(stream_size, int):
+        size = stream_size
+    elif isinstance(declared_size, int):
+        size = declared_size
+    else:
+        size = None
+    return canonical_type, buffered, size
+
+
+def validate_upload(
+    file: UploadFile,
+    allowed_types: List[str],
+    max_size: Optional[int] = None
+) -> Tuple[str, bytes]:
+    """
+    Validate uploaded file for security and type compliance.
+    
+    Args:
+        file: The uploaded file
+        allowed_types: List of allowed file types ('image', 'video', 'document')
+        max_size: Maximum file size in bytes (auto-determined if None)
+        
+    Returns:
+        Tuple of (mime_type, file_content)
+        
+    Raises:
+        HTTPException: If validation fails
+    """
+    canonical_type, buffered, _size = _validate_upload_common(file, allowed_types, max_size)
+
     # Callers still receive the bytes (see services/utils/upload_content.py),
     # so the size cap above doubles as the per-request memory ceiling.
     content = buffered if buffered is not None else file.file.read()
     _rewind(file.file)
-
-    canonical_type = EXT_TO_CANONICAL_MIME.get(ext, file.content_type)
     return canonical_type, content
+
+
+def validate_upload_stream(
+    file: UploadFile,
+    allowed_types: List[str],
+    max_size: Optional[int] = None,
+) -> Tuple[str, int]:
+    """Validate an upload WITHOUT reading its body into memory.
+
+    Same extension / SVG / size / magic-byte rules as :func:`validate_upload`,
+    but the body stays in the (spooled) upload stream, which is left rewound
+    to offset 0 so the caller can stream it onwards — e.g. chunked to Google
+    Drive — instead of holding up to 5 GiB in RAM.
+
+    Returns ``(canonical_mime, size_in_bytes)``.
+    """
+    canonical_type, buffered, size = _validate_upload_common(file, allowed_types, max_size)
+    if size is None:
+        # Unmeasurable stream that was not bounded-read either: measure once by
+        # seeking; fall back to a full read only if the stream cannot seek.
+        size = _stream_length(file.file)
+        if size is None:
+            size = len(file.file.read())
+    _rewind(file.file)
+    return canonical_type, int(size)
 
 
 def get_safe_filename(

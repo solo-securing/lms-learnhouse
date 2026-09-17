@@ -120,6 +120,21 @@ optional: the feature stays disabled or uses a runtime fallback when the variabl
 | `LEARNHOUSE_S3_API_BUCKET_NAME` | S3-compatible bucket name when using `s3api`. | string | unset; required for S3 storage | API, CLI |
 | `LEARNHOUSE_S3_API_ENDPOINT_URL` | S3-compatible endpoint URL. Leave unset for provider defaults where supported. | URL | unset | API, CLI |
 
+### Google Drive video storage
+
+Optional, instance-wide. Lets instructors keep a video activity's file on the operator's personal Google Drive instead of the server. See [Content Storage → Google Drive for video activities](/self-hosting/configuration/storage#google-drive-for-video-activities) for the one-time setup (`gdrive-authorize`).
+
+| Variable | Description | Type | Default / required | Used by |
+| --- | --- | --- | --- | --- |
+| `LEARNHOUSE_GDRIVE_ENABLED` | Turns the Google Drive storage option on. Accepts `true`/`1`/`yes`/`on` (case-insensitive); anything else is off. The option is only offered to instructors once the credential and token below are also valid. | boolean | `false` | API |
+| `LEARNHOUSE_GDRIVE_CREDENTIALS_PATH` | Path to the OAuth **client** JSON downloaded from Google Cloud Console (root key `web` or `installed`). Read-only. | file path | unset; required when enabled | API, CLI |
+| `LEARNHOUSE_GDRIVE_TOKEN_PATH` | Path where `cli.py gdrive-authorize` writes the user token (mode `0600`) and where the API refreshes it. | file path | unset; required when enabled | API, CLI |
+| `LEARNHOUSE_GDRIVE_ROOT_FOLDER_NAME` | Name of the Drive folder the app creates and stores everything under (`<root>/<org>/<course>/<activity>/video.mp4`). Do **not** create it by hand — the `drive.file` scope cannot see folders the app did not create. | string | `LearnHouse` | API |
+
+<Callout type="warning">
+Never commit the credential or token file, and never bake them into a Docker image. Both are referenced by path only; the repository's `.gitignore` / `.dockerignore` already exclude `gg_drive_credentials/` and `**/gdrive_token*.json`. Mount them into the container (read-write for the token) and point the two path variables at the mount.
+</Callout>
+
 ## Payments
 
 | Variable | Description | Type | Default / required | Used by |

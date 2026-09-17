@@ -112,3 +112,15 @@ tinybird_config:
   api_url: ""
   ingest_token: ""
   read_token: ""
+
+gdrive_config:
+  # Google Drive storage for video activities (instance-wide, opt-in).
+  # The OAuth client credential and the token written by `cli.py gdrive-authorize`
+  # MUST NOT be committed to git or baked into a Docker image — reference them
+  # by path only (see .gitignore / .dockerignore). Override with
+  # LEARNHOUSE_GDRIVE_ENABLED / LEARNHOUSE_GDRIVE_CREDENTIALS_PATH /
+  # LEARNHOUSE_GDRIVE_TOKEN_PATH / LEARNHOUSE_GDRIVE_ROOT_FOLDER_NAME.
+  enabled: false
+  credentials_path: null
+  token_path: null
+  root_folder_name: "LearnHouse"

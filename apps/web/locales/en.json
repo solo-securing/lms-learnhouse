@@ -1401,6 +1401,19 @@
   },
   "activities": {
     "video": "Video",
+    "video_gdrive": {
+      "storage_location": "Storage location",
+      "storage_server": "Server",
+      "storage_gdrive": "Google Drive",
+      "storage_warning": "The file is stored on the operator's personal Google Drive. Anyone with the link can watch it; downloading is disabled but screen recording cannot be prevented.",
+      "uploading_to_drive": "Uploading to Google Drive…",
+      "label": "Google Drive Video",
+      "original_file": "Original file",
+      "replace_video": "Replace video",
+      "replace_hint": "Leave empty to keep the current video",
+      "embed_hint": "If the video does not show, allow third-party embedded content in your browser.",
+      "storage_change_error": "The storage location of a video activity cannot be changed."
+    },
     "document": "Document",
     "page": "Page",
     "assignment": "Assignment",

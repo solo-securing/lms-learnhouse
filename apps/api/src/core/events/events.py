@@ -90,6 +90,12 @@ def startup_app(app: FastAPI) -> Callable:
         from src.services.utils.caption_jobs import start_consumer as start_captions_consumer
         start_captions_consumer()
 
+        # Google Drive video storage: one readiness log line at boot so an
+        # operator sees "enabled but not ready" here rather than at the first
+        # upload. Never raises; makes no network call when the flag is off.
+        from src.services.integrations.gdrive.readiness import log_startup_status as log_gdrive_status
+        await log_gdrive_status()
+
         # Start Enterprise Edition Startup tasks if available
         run_ee_startup(app)
 

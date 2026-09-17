@@ -949,6 +949,19 @@
   },
   "activities": {
     "video": "Video",
+    "video_gdrive": {
+      "storage_location": "Nơi lưu trữ",
+      "storage_server": "Máy chủ",
+      "storage_gdrive": "Google Drive",
+      "storage_warning": "File được lưu trên Google Drive cá nhân của người vận hành. Ai có liên kết đều xem được; đã tắt tải xuống nhưng không thể chống quay màn hình.",
+      "uploading_to_drive": "Đang đẩy lên Google Drive…",
+      "label": "Video Google Drive",
+      "original_file": "Tên file gốc",
+      "replace_video": "Thay video",
+      "replace_hint": "Để trống nếu muốn giữ video hiện tại",
+      "embed_hint": "Nếu video không hiển thị, hãy cho phép nội dung nhúng của bên thứ ba trong trình duyệt.",
+      "storage_change_error": "Không thể đổi nơi lưu trữ của một hoạt động video."
+    },
     "document": "Tài liệu",
     "page": "Trang",
     "assignment": "Bài tập",

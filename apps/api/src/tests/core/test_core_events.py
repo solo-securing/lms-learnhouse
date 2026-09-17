@@ -451,3 +451,50 @@ async def test_periodic_migration_cleanup_logs_and_exits(monkeypatch, caplog):
             await events._periodic_migration_cleanup()
 
     assert "Periodic migration cleanup failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_startup_logs_gdrive_readiness(monkeypatch):
+    """Boot runs the Google Drive readiness log hook exactly once (T021)."""
+    from unittest.mock import AsyncMock
+
+    app = SimpleNamespace()
+    monkeypatch.setattr(events, "get_learnhouse_config", lambda: SimpleNamespace(name="cfg"))
+
+    async def _noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(events, "connect_to_db", _noop)
+    monkeypatch.setattr(events, "create_logs_dir", _noop)
+    monkeypatch.setattr(events, "check_content_directory", _noop)
+    monkeypatch.setattr(events, "auto_install", _noop)
+    monkeypatch.setattr(events, "_reconcile_packs", _noop)
+    monkeypatch.setattr(events, "run_ee_startup", lambda app_: None)
+    monkeypatch.setattr(
+        "src.services.courses.migration.migration_service.cleanup_old_temp_migrations",
+        lambda: None,
+    )
+
+    class _FakeTask:
+        def cancel(self):
+            pass
+
+    def create_task(coro):
+        coro.close()
+        return _FakeTask()
+
+    monkeypatch.setattr(events.asyncio, "create_task", create_task)
+    # Keep the HLS/captions consumers idle (no Redis) so no background task
+    # object outlives this test inside their module globals.
+    import src.services.utils.caption_jobs as _cap_jobs
+    import src.services.utils.hls_jobs as _hls_jobs
+
+    monkeypatch.setattr(_cap_jobs, "get_redis_client", lambda: None)
+    monkeypatch.setattr(_hls_jobs, "get_redis_client", lambda: None)
+
+    log_gdrive = AsyncMock()
+    monkeypatch.setattr("src.services.integrations.gdrive.readiness.log_startup_status", log_gdrive)
+
+    await events.startup_app(app)()
+
+    log_gdrive.assert_awaited_once()

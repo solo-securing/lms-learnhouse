@@ -18,6 +18,7 @@ from fastapi import HTTPException, status, UploadFile, Request
 from uuid import uuid4
 from datetime import datetime
 from src.security.rbac import check_resource_access, AccessAction
+from src.services.courses.activities.activities import STORAGE_CHANGE_DETAIL, is_gdrive_activity
 
 
 async def create_documentpdf_activity(
@@ -173,6 +174,11 @@ async def update_documentpdf_activity(
     await check_resource_access(
         request, db_session, current_user, course.course_uuid, AccessAction.UPDATE
     )
+
+    # The PDF path must not rename, re-file or upload into a Drive video
+    # activity (FR-004 / FR-014): refuse before touching anything.
+    if is_gdrive_activity(activity):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=STORAGE_CHANGE_DETAIL)
 
     if name:
         activity.name = name

@@ -14,6 +14,7 @@ import { useCourse } from '@components/Contexts/CourseContext'
 import { getActivity } from '@services/courses/activities'
 import { getActivityBlockMediaDirectory } from '@services/media/media'
 import { Loader2 } from 'lucide-react'
+import { useTranslation } from 'react-i18next'
 
 // Shared, lightweight activity preview. Two surfaces:
 //
@@ -395,6 +396,7 @@ function EmptyState({ text }: { text: string }) {
 function PreviewBody({ activity }: { activity: any }) {
   const org = useOrg() as any
   const course = useCourse() as any
+  const { t } = useTranslation()
   const type = activity.activity_type
   const sub = activity.activity_sub_type
   const content = activity.content || {}
@@ -436,6 +438,15 @@ function PreviewBody({ activity }: { activity: any }) {
   }
 
   if (type === 'TYPE_VIDEO') {
+    if (sub === 'SUBTYPE_VIDEO_GDRIVE') {
+      // Plain text only: never the Drive file id and never a link.
+      return (
+        <p className="text-xs text-gray-600 break-all">
+          {t('activities.video_gdrive.label')}
+          {content.original_filename ? ` · ${content.original_filename}` : ''}
+        </p>
+      )
+    }
     if (content.uri) {
       return (
         <a

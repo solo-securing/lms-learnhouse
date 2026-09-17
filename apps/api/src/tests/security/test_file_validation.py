@@ -115,3 +115,108 @@ class TestSafeFilename:
 
     def test_unknown_content_type_falls_back_to_bin(self):
         assert get_safe_filename("x.weird", "uuid", content_type="application/x-unknown") == "uuid.bin"
+
+
+# ---------------------------------------------------------------------------
+# validate_upload_stream — validation without reading the body into memory
+# (Google Drive upload path streams the spooled file onwards).
+# ---------------------------------------------------------------------------
+
+from unittest.mock import patch  # noqa: E402
+
+from src.security.file_validation import validate_upload_stream  # noqa: E402
+
+_MP4 = b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64
+_WEBM = b"\x1a\x45\xdf\xa3" + b"\x00" * 64
+
+
+class _CountingBytesIO(io.BytesIO):
+    """Records how many bytes were actually read through the stream."""
+
+    def __init__(self, data):
+        super().__init__(data)
+        self.bytes_read = 0
+
+    def read(self, size=-1):
+        chunk = super().read(size)
+        self.bytes_read += len(chunk)
+        return chunk
+
+
+class TestValidateUploadStream:
+    @pytest.mark.parametrize(
+        "name,data,expected_mime",
+        [("clip.mp4", _MP4, "video/mp4"), ("clip.webm", _WEBM, "video/webm")],
+    )
+    def test_accepts_video_and_returns_mime_and_size(self, name, data, expected_mime):
+        upload = _FakeUpload(name, data, content_type=expected_mime)
+        mime, size = validate_upload_stream(upload, ["video"])
+        assert mime == expected_mime
+        assert size == len(data)
+        # Stream is rewound so the caller can stream the body onwards.
+        assert upload.file.tell() == 0
+        assert upload.file.read() == data
+
+    def test_does_not_read_whole_body(self):
+        data = _MP4 + b"\x00" * (200 * 1024)
+        stream = _CountingBytesIO(data)
+        upload = _FakeUpload("clip.mp4", b"", content_type="video/mp4")
+        upload.file = stream
+        _mime, size = validate_upload_stream(upload, ["video"])
+        assert size == len(data)
+        # Only the 64 KiB magic-byte prefix is read; never the full body.
+        assert stream.bytes_read <= 64 * 1024
+
+    def test_rejects_disallowed_extension_before_reading(self):
+        stream = _CountingBytesIO(b"\x1a\x45\xdf\xa3" + b"\x00" * 32)
+        upload = _FakeUpload("movie.mkv", b"", content_type="video/x-matroska")
+        upload.file = stream
+        with pytest.raises(HTTPException) as exc:
+            validate_upload_stream(upload, ["video"])
+        assert exc.value.status_code == 415
+        assert stream.bytes_read == 0
+
+    def test_rejects_over_five_gib(self):
+        upload = _FakeUpload("huge.mp4", _MP4, content_type="video/mp4")
+        with patch(
+            "src.security.file_validation._stream_length",
+            return_value=5 * 1024 * 1024 * 1024 + 1,
+        ):
+            with pytest.raises(HTTPException) as exc:
+                validate_upload_stream(upload, ["video"])
+        assert exc.value.status_code == 413
+
+    def test_rejects_wrong_magic_bytes(self):
+        upload = _FakeUpload("clip.mp4", b"definitely not a video" + b"\x00" * 32, content_type="video/mp4")
+        with pytest.raises(HTTPException) as exc:
+            validate_upload_stream(upload, ["video"])
+        assert exc.value.status_code == 415
+
+    def test_blocks_svg_and_missing_file(self):
+        with pytest.raises(HTTPException) as exc:
+            validate_upload_stream(_FakeUpload("x.svg", b"<svg/>"), ["video"])
+        assert exc.value.status_code == 415
+        with pytest.raises(HTTPException) as exc:
+            validate_upload_stream(_FakeUpload("", b""), ["video"])
+        assert exc.value.status_code == 400
+
+    def test_unmeasurable_stream_falls_back_to_bounded_read(self):
+        class _NoSeekEnd(io.BytesIO):
+            def seek(self, pos, whence=0):
+                if whence == 2:
+                    raise OSError("cannot seek to end")
+                return super().seek(pos, whence)
+
+        upload = _FakeUpload("clip.mp4", b"", content_type="video/mp4")
+        upload.file = _NoSeekEnd(_MP4)
+        mime, size = validate_upload_stream(upload, ["video"], max_size=1024 * 1024)
+        assert mime == "video/mp4"
+        assert size == len(_MP4)
+
+    def test_validate_upload_still_returns_bytes(self):
+        # The legacy API is a thin wrapper: same checks, plus the body.
+        upload = _FakeUpload("clip.mp4", _MP4, content_type="video/mp4")
+        mime, content = validate_upload(upload, ["video"])
+        assert mime == "video/mp4"
+        assert content == _MP4
+        assert upload.file.tell() == 0

@@ -17,6 +17,7 @@ from src.routers import stream
 from src.routers import api_tokens
 from src.routers import webhooks
 from src.routers.integrations import zapier as zapier_integration
+from src.routers.integrations import gdrive as gdrive_integration
 from src.routers.ai import ai, magicblocks, courseplanning, rag, images, quiz, assignment_gen, scenario, audio
 from src.routers.boards import boards_playground
 from src.routers.orgs import ai_credits
@@ -125,6 +126,13 @@ v1_router.include_router(
     zapier_integration.router,
     prefix="/integrations/zapier",
     tags=["integrations", "zapier"],
+)
+# Google Drive readiness for the create-video dialog (auth enforced in-handler:
+# any signed-in principal, anonymous → 401).
+v1_router.include_router(
+    gdrive_integration.router,
+    prefix="/integrations/gdrive",
+    tags=["integrations", "gdrive"],
 )
 v1_router.include_router(
     custom_domains.router,

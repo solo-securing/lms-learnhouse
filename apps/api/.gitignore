@@ -171,3 +171,6 @@ run.py
 
 # Tinybird CLI local state
 .tinyb
+# Google Drive integration (credential + token files live outside git)
+gg_drive_credentials/
+**/gdrive_token*.json
