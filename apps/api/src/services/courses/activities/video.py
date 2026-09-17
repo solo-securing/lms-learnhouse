@@ -23,6 +23,17 @@ from fastapi import HTTPException, status, UploadFile, Request
 from uuid import uuid4
 from datetime import datetime
 from src.security.rbac import check_resource_access, AccessAction
+from src.security.file_validation import validate_upload_stream
+from src.services.courses.activities.activities import STORAGE_CHANGE_DETAIL, is_gdrive_activity
+from src.services.integrations.gdrive.errors import GDriveError, to_http_exception
+from src.services.integrations.gdrive.readiness import require_ready
+from src.services.integrations.gdrive.service import (
+    delete_file_best_effort,
+    delete_folder_best_effort,
+    has_other_reference,
+    ensure_activity_folder,
+    upload_activity_video,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +47,7 @@ async def create_video_activity(
     video_file: UploadFile | None = None,
     details: str = "{}",
     extra_metadata: Optional[dict] = None,
+    storage: str = "server",
 ):
     # get chapter_id
     statement = select(Chapter).where(Chapter.id == chapter_id)
@@ -97,6 +109,22 @@ async def create_video_activity(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Video : No video file provided",
+        )
+
+    if storage == "gdrive":
+        if not organization:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        return await _create_gdrive_video_activity(
+            name=name,
+            chapter=chapter,
+            coursechapter=coursechapter,
+            course=course,
+            organization=organization,
+            activity_uuid=activity_uuid,
+            current_user=current_user,
+            db_session=db_session,
+            video_file=video_file,
+            extra_metadata=extra_metadata,
         )
 
     # Upload video first to get safe filename
@@ -166,6 +194,123 @@ async def create_video_activity(
     except Exception:
         logger.exception("Failed to enqueue HLS transcode for %s", activity.activity_uuid)
 
+    return ActivityRead.model_validate(activity)
+
+
+_MAX_ORIGINAL_FILENAME = 255
+
+
+def _gdrive_content(activity_uuid: str, upload, original_filename: str) -> dict:
+    """``content`` for a Drive video activity (contracts/drive-content.md) — no URL, ever."""
+    return {
+        "activity_uuid": activity_uuid,
+        "storage": "gdrive",
+        "gdrive_file_id": upload.file_id,
+        "gdrive_folder_id": upload.folder_id,
+        "original_filename": original_filename[:_MAX_ORIGINAL_FILENAME],
+        "mime_type": upload.mime_type,
+        "size": upload.size,
+    }
+
+
+async def _create_gdrive_video_activity(
+    *,
+    name: str,
+    chapter: Chapter,
+    coursechapter: CourseChapter,
+    course: Course,
+    organization: Organization,
+    activity_uuid: str,
+    current_user: PublicUser,
+    db_session: AsyncSession,
+    video_file: UploadFile,
+    extra_metadata: Optional[dict],
+) -> ActivityRead:
+    """Google Drive branch of :func:`create_video_activity`.
+
+    Validate the stream (never the whole body in RAM) → release the DB
+    connection → push to Drive, share, verify → only then insert the Activity
+    with ``SUBTYPE_VIDEO_GDRIVE``. Playback ``details`` are ignored (the Drive
+    embed has none). A DB failure after the upload removes the Drive folder.
+    """
+    try:
+        mime_type, size = validate_upload_stream(video_file, ["video"])
+        original_filename = (video_file.filename or "video")[:_MAX_ORIGINAL_FILENAME]
+
+        # The Drive upload can take a very long time: do not hold a pooled
+        # connection (or an open transaction) across it.
+        await db_session.commit()
+
+        try:
+            upload = await upload_activity_video(
+                org_uuid=organization.org_uuid,
+                course_uuid=course.course_uuid,
+                activity_uuid=activity_uuid,
+                file=video_file,
+                mime_type=mime_type,
+                size=size,
+                original_filename=original_filename,
+                user_id=getattr(current_user, "id", None),
+            )
+        except GDriveError as err:
+            raise to_http_exception(err)
+    finally:
+        # Release the spooled temp file now (SC-004) instead of waiting for the
+        # request teardown; UploadFile.close() is idempotent.
+        await video_file.close()
+
+    context = (
+        f"user={getattr(current_user, 'id', None)} org={organization.org_uuid} "
+        f"course={course.course_uuid} activity={activity_uuid}"
+    )
+    try:
+        activity = Activity(
+            name=name,
+            activity_type=ActivityTypeEnum.TYPE_VIDEO,
+            activity_sub_type=ActivitySubTypeEnum.SUBTYPE_VIDEO_GDRIVE,
+            activity_uuid=activity_uuid,
+            org_id=coursechapter.org_id,
+            course_id=coursechapter.course_id,
+            content=_gdrive_content(activity_uuid, upload, original_filename),
+            details={},
+            creation_date=str(datetime.now()),
+            update_date=str(datetime.now()),
+            extra_metadata=extra_metadata,
+        )
+        db_session.add(activity)
+        await db_session.commit()
+        await db_session.refresh(activity)
+
+        statement = (
+            select(ChapterActivity)
+            .where(ChapterActivity.chapter_id == chapter.id)
+            .order_by(ChapterActivity.order)  # type: ignore
+        )
+        chapter_activities = (await db_session.execute(statement)).scalars().all()
+        last_order = chapter_activities[-1].order if chapter_activities else 0
+        chapter_activity_object = ChapterActivity(
+            chapter_id=chapter.id,  # type: ignore
+            activity_id=activity.id,  # type: ignore
+            course_id=coursechapter.course_id,
+            org_id=coursechapter.org_id,
+            creation_date=str(datetime.now()),
+            update_date=str(datetime.now()),
+            order=last_order + 1,
+        )
+        db_session.add(chapter_activity_object)
+        await db_session.commit()
+    except Exception:
+        logger.exception("Drive video activity could not be saved (%s); removing Drive folder %s", context, upload.folder_id)
+        try:
+            await db_session.rollback()
+        except Exception:  # pragma: no cover - rollback of a dead session
+            pass
+        await delete_folder_best_effort(upload.folder_id, context=context)
+        raise
+
+    logger.info(
+        "Drive video activity created (%s): file=%s folder=%s result=ok", context, upload.file_id, upload.folder_id
+    )
     return ActivityRead.model_validate(activity)
 
 
@@ -305,6 +450,16 @@ async def update_video_activity(
         request, db_session, current_user, course.course_uuid, AccessAction.UPDATE
     )
 
+    if activity.activity_sub_type == ActivitySubTypeEnum.SUBTYPE_VIDEO_GDRIVE:
+        return await _update_gdrive_video_activity(
+            activity=activity,
+            course=course,
+            current_user=current_user,
+            db_session=db_session,
+            name=name,
+            video_file=video_file,
+        )
+
     if name is not None:
         activity.name = name
 
@@ -340,6 +495,126 @@ async def update_video_activity(
     await db_session.commit()
     await db_session.refresh(activity)
 
+    return ActivityRead.model_validate(activity)
+
+
+async def _update_gdrive_video_activity(
+    *,
+    activity: Activity,
+    course: Course,
+    current_user: PublicUser | AnonymousUser,
+    db_session: AsyncSession,
+    name: Optional[str],
+    video_file: UploadFile | None,
+) -> ActivityRead:
+    """Google Drive branch of :func:`update_video_activity`.
+
+    Only ``name`` and ``video_file`` have an effect; playback settings are
+    ignored (the Drive embed has none) and the storage location never changes.
+    Every update — even a bare rename — needs the integration ready (FR-004).
+    A replacement file goes into the folder resolved from THIS activity's own
+    uuid path (a cloned activity sharing the old folder keeps its file), and
+    the previous file is removed after the commit unless another activity
+    still references it.
+    """
+    try:
+        await require_ready()
+    except GDriveError as err:
+        raise to_http_exception(err)
+
+    user_id = getattr(current_user, "id", None)
+    statement = select(Organization).where(Organization.id == activity.org_id)
+    organization = (await db_session.execute(statement)).scalars().first()
+    if not organization:
+        raise HTTPException(status_code=404, detail="Organization not found")
+    # FR-013: every audit line (rename, replace, best-effort cleanup) names the
+    # acting user and the org / course / activity.
+    context = (
+        f"user={user_id} org={organization.org_uuid} course={course.course_uuid} "
+        f"activity={activity.activity_uuid}"
+    )
+
+    if not (video_file and video_file.filename):
+        if name is not None:
+            activity.name = name
+        activity.update_date = str(datetime.now())
+        db_session.add(activity)
+        await db_session.commit()
+        await db_session.refresh(activity)
+        logger.info("Drive video activity updated (%s): fields=name result=ok", context)
+        return ActivityRead.model_validate(activity)
+
+    try:
+        if video_file.content_type not in ["video/mp4", "video/webm"]:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Video : Wrong video format")
+        mime_type, size = validate_upload_stream(video_file, ["video"])
+        original_filename = (video_file.filename or "video")[:_MAX_ORIGINAL_FILENAME]
+
+        old_content = dict(activity.content or {})
+        old_file_id = old_content.get("gdrive_file_id")
+        activity_uuid = activity.activity_uuid
+        org_uuid = organization.org_uuid
+        course_uuid = course.course_uuid
+
+        # Nothing is mutated yet; release the connection for the long upload.
+        await db_session.commit()
+
+        created_folder: str | None = None
+        try:
+            folder_id, created = await ensure_activity_folder(org_uuid, course_uuid, activity_uuid)
+            if created:
+                created_folder = folder_id
+            upload = await upload_activity_video(
+                org_uuid=org_uuid,
+                course_uuid=course_uuid,
+                activity_uuid=activity_uuid,
+                file=video_file,
+                mime_type=mime_type,
+                size=size,
+                original_filename=original_filename,
+                user_id=user_id,
+                folder_id=folder_id,
+            )
+        except GDriveError as err:
+            if created_folder:
+                # A cloned activity had no folder of its own yet: this request
+                # created one and nothing landed in it, so do not leave it behind.
+                await delete_folder_best_effort(created_folder, context=context)
+            raise to_http_exception(err)
+    finally:
+        # Release the spooled temp file as soon as Drive has it (SC-004).
+        await video_file.close()
+
+    try:
+        from sqlalchemy.orm.attributes import flag_modified
+
+        if name is not None:
+            activity.name = name
+        activity.content = _gdrive_content(activity_uuid, upload, original_filename)
+        flag_modified(activity, "content")
+        activity.update_date = str(datetime.now())
+        db_session.add(activity)
+        await db_session.commit()
+        await db_session.refresh(activity)
+    except Exception:
+        logger.exception("Drive video replacement could not be saved (%s); removing new file %s", context, upload.file_id)
+        try:
+            await db_session.rollback()
+        except Exception:  # pragma: no cover - rollback of a dead session
+            pass
+        await delete_file_best_effort(upload.file_id, context=context)
+        raise
+
+    if old_file_id and old_file_id != upload.file_id:
+        if await has_other_reference(db_session, activity.id, gdrive_file_id=old_file_id):
+            logger.info("Drive file %s kept: still referenced by another activity (%s)", old_file_id, context)
+        else:
+            await delete_file_best_effort(old_file_id, context=context)
+
+    logger.info(
+        "Drive video activity replaced (%s): old_file=%s new_file=%s folder=%s result=ok",
+        context, old_file_id, upload.file_id, upload.folder_id,
+    )
     return ActivityRead.model_validate(activity)
 
 
@@ -480,6 +755,11 @@ async def update_external_video_activity(
     await check_resource_access(
         request, db_session, current_user, course.course_uuid, AccessAction.UPDATE
     )
+
+    # A Drive video never gets a `uri` (FR-008) or playback details, and its
+    # storage location never changes (FR-014): refuse before touching anything.
+    if is_gdrive_activity(activity):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=STORAGE_CHANGE_DETAIL)
 
     if name is not None:
         activity.name = name

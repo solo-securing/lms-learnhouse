@@ -626,6 +626,77 @@ async def _demo_teardown() -> None:
         await async_engine.dispose()
 
 
+@cli.command(name="gdrive-authorize")
+def gdrive_authorize(
+    port: Annotated[
+        int,
+        typer.Option(help="Loopback port; must match the registered redirect URI http://localhost:<port>/"),
+    ] = 8765,
+    no_browser: Annotated[
+        bool, typer.Option("--no-browser", help="Print the consent URL instead of opening a browser")
+    ] = False,
+):
+    """
+    Authorize the Google Drive video-storage integration (one-time, interactive).
+
+    Opens Google's consent screen for scope drive.file and writes the token to
+    LEARNHOUSE_GDRIVE_TOKEN_PATH (mode 0600). Works even while
+    LEARNHOUSE_GDRIVE_ENABLED is false. Headless host: pass --no-browser and
+    forward the port (ssh -L 8765:localhost:8765 <host>).
+    """
+    from src.services.integrations.gdrive.authorize import run_authorize
+    from src.services.integrations.gdrive.errors import GDriveError
+
+    cfg = get_learnhouse_config().gdrive_config
+    try:
+        email = run_authorize(
+            credentials_path=cfg.credentials_path,
+            token_path=cfg.token_path,
+            port=port,
+            open_browser=not no_browser,
+        )
+    except GDriveError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        raise typer.Exit(code=1)
+    print(f"Google Drive authorized as {email}. Token saved to {cfg.token_path}.")
+
+
+@cli.command(name="gdrive-status")
+def gdrive_status():
+    """
+    Report the Google Drive integration's readiness (exit 0 ready / 1 otherwise).
+
+    Bypasses the in-process cache. When ready, also prints the Drive account
+    and its storage quota. Never prints token or secret contents.
+    """
+    from src.services.integrations.gdrive.client import DriveClient
+    from src.services.integrations.gdrive.errors import GDriveError
+    from src.services.integrations.gdrive.readiness import (
+        format_status_report,
+        get_access_token,
+        get_status,
+    )
+
+    cfg = get_learnhouse_config().gdrive_config
+
+    async def _collect():
+        status = await get_status(force=True)
+        about = None
+        if status.ready:
+            try:
+                async with DriveClient(get_access_token) as client:
+                    about = await client.about()
+            except GDriveError as exc:
+                print(f"⚠️  ready, but Drive could not be queried: {type(exc).__name__}", file=sys.stderr)
+        return status, about
+
+    status, about = asyncio.run(_collect())
+    lines, code = format_status_report(status, about, cfg.credentials_path, cfg.token_path)
+    for line in lines:
+        print(line)
+    raise typer.Exit(code=code)
+
+
 @cli.command()
 def main():
     cli()

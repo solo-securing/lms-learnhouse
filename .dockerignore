@@ -139,3 +139,7 @@ media/
 README.md
 docs/
 *.md
+
+gg_drive_credentials/
+# Google Drive integration: OAuth tokens live on disk, never in the image
+**/gdrive_token*.json

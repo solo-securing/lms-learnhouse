@@ -140,6 +140,24 @@ class InternalPaymentsConfig(BaseModel):
     stripe: InternalStripeConfig
 
 
+class GDriveConfig(BaseModel):
+    """Instance-wide Google Drive storage for video activities.
+
+    ``credentials_path`` points at the OAuth *client* JSON downloaded from Google
+    Cloud Console (root key ``web`` or ``installed``); ``token_path`` is where
+    ``cli.py gdrive-authorize`` writes the user token. Both files live on disk
+    outside git / the Docker image and are only ever referenced by path here.
+    ``root_folder_name`` is the Drive folder the app creates (scope ``drive.file``
+    cannot see folders created by hand) under which ``<org>/<course>/<activity>``
+    folders are laid out.
+    """
+
+    enabled: bool = False
+    credentials_path: str | None = None
+    token_path: str | None = None
+    root_folder_name: str = "LearnHouse"
+
+
 class LearnHouseConfig(BaseModel):
     site_name: str
     site_description: str
@@ -154,6 +172,7 @@ class LearnHouseConfig(BaseModel):
     payments_config: InternalPaymentsConfig
     tinybird_config: TinybirdConfig | None
     judge0_config: Judge0Config | None
+    gdrive_config: GDriveConfig = GDriveConfig()
 
 
 def _env_bool(env_value, yaml_value):
@@ -554,6 +573,34 @@ def get_learnhouse_config() -> LearnHouseConfig:
             client_secret=judge0_client_secret,
         )
 
+    # Google Drive config — env always wins over YAML (repo convention). The
+    # flag goes through _env_bool so LEARNHOUSE_GDRIVE_ENABLED=false is false.
+    yaml_gdrive_config = yaml_config.get("gdrive_config", {}) or {}
+    gdrive_enabled = _env_bool(
+        os.environ.get("LEARNHOUSE_GDRIVE_ENABLED"), yaml_gdrive_config.get("enabled")
+    )
+    gdrive_credentials_path = (
+        os.environ.get("LEARNHOUSE_GDRIVE_CREDENTIALS_PATH")
+        or yaml_gdrive_config.get("credentials_path")
+        or None
+    )
+    gdrive_token_path = (
+        os.environ.get("LEARNHOUSE_GDRIVE_TOKEN_PATH")
+        or yaml_gdrive_config.get("token_path")
+        or None
+    )
+    gdrive_root_folder_name = (
+        os.environ.get("LEARNHOUSE_GDRIVE_ROOT_FOLDER_NAME")
+        or yaml_gdrive_config.get("root_folder_name")
+        or "LearnHouse"
+    )
+    gdrive_config = GDriveConfig(
+        enabled=bool(gdrive_enabled),
+        credentials_path=gdrive_credentials_path,
+        token_path=gdrive_token_path,
+        root_folder_name=str(gdrive_root_folder_name),
+    )
+
     # Payments config
     env_stripe_secret_key = os.environ.get("LEARNHOUSE_STRIPE_SECRET_KEY")
     env_stripe_publishable_key = os.environ.get("LEARNHOUSE_STRIPE_PUBLISHABLE_KEY")
@@ -753,6 +800,7 @@ def get_learnhouse_config() -> LearnHouseConfig:
         ),
         tinybird_config=tinybird_config,
         judge0_config=judge0_config,
+        gdrive_config=gdrive_config,
     )
 
     return config

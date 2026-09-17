@@ -40,6 +40,14 @@ from src.security.superadmin import is_user_superadmin
 from src.services.courses.thumbnails import upload_thumbnail
 from src.services.search.normalization import LIKE_ESCAPE_CHAR, build_like_pattern
 from src.services.webhooks.dispatch import dispatch_webhooks
+from src.db.courses.activities import Activity, ActivitySubTypeEnum
+from src.services.integrations.gdrive.errors import GDriveError, to_http_exception
+from src.services.integrations.gdrive.readiness import require_ready
+from src.services.integrations.gdrive.service import (
+    delete_folder_best_effort,
+    find_course_folder,
+    has_other_reference,
+)
 from fastapi import HTTPException, Request, UploadFile, status
 from datetime import datetime
 
@@ -931,6 +939,23 @@ async def delete_course(
     # RBAC check
     await check_resource_access(request, db_session, current_user, course.course_uuid, AccessAction.DELETE)
 
+    # Drive video activities inside the course: the DB cascade removes the rows
+    # without running delete_activity, so gate here (FR-004) and remember what
+    # must be cleaned up on Drive after the commit.
+    drive_activities = (
+        await db_session.execute(
+            select(Activity).where(
+                Activity.course_id == course.id,
+                Activity.activity_sub_type == ActivitySubTypeEnum.SUBTYPE_VIDEO_GDRIVE,
+            )
+        )
+    ).scalars().all()
+    if drive_activities:
+        try:
+            await require_ready()
+        except GDriveError as err:
+            raise to_http_exception(err)
+
     # Clean up content files from storage
     org_statement = select(Organization).where(Organization.id == course.org_id)
     org = (await db_session.execute(org_statement)).scalars().first()
@@ -942,9 +967,26 @@ async def delete_course(
     course_uuid_val = course.course_uuid
     course_name_val = course.name
     course_org_id = course.org_id
+    course_id_val = course.id
+    org_uuid_val = org.org_uuid if org else None
+    drive_folder_ids = [
+        str(a.content.get("gdrive_folder_id"))
+        for a in drive_activities
+        if a.content and a.content.get("gdrive_folder_id")
+    ]
 
     await db_session.delete(course)
     await db_session.commit()
+
+    if drive_folder_ids and org_uuid_val:
+        await _cleanup_course_drive_folder(
+            db_session,
+            org_uuid=org_uuid_val,
+            course_uuid=course_uuid_val,
+            course_id=course_id_val,
+            folder_ids=drive_folder_ids,
+            user_id=getattr(current_user, "id", None),
+        )
 
     # Feature usage — decrement only AFTER the row is actually gone. The usage
     # counter lives in Redis and is written immediately/irreversibly; doing it
@@ -963,6 +1005,37 @@ async def delete_course(
     )
 
     return {"detail": "Course deleted"}
+
+
+async def _cleanup_course_drive_folder(
+    db_session: AsyncSession,
+    *,
+    org_uuid: str,
+    course_uuid: str,
+    course_id: int,
+    folder_ids: list[str],
+    user_id,
+) -> None:
+    """Best-effort removal of ``<root>/<org>/<course>`` on Drive after a course delete.
+
+    ``content`` never stores the course folder id, so it is looked up by name
+    (never created). Skipped, with a WARNING naming the ids for a manual
+    clean-up, when a cloned activity in another course still points inside it.
+    """
+    context = f"user={user_id} org={org_uuid} course={course_uuid}"
+    if await has_other_reference(db_session, None, exclude_course_id=course_id, gdrive_folder_ids=folder_ids):
+        logger.warning(
+            "Drive course folder for %s NOT deleted: activities in other courses still reference folders %s; "
+            "clean up by hand once they are gone",
+            course_uuid, ", ".join(folder_ids),
+        )
+        return
+    course_folder_id = await find_course_folder(org_uuid, course_uuid)
+    if not course_folder_id:
+        logger.info("Drive course folder not found for %s; nothing to delete", context)
+        return
+    await delete_folder_best_effort(course_folder_id, context=context)
+    logger.info("Drive course folder %s handled after course delete (%s)", course_folder_id, context)
 
 
 async def get_user_courses(

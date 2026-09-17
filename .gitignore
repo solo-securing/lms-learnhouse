@@ -75,3 +75,7 @@ apps/api/ee
 # Nix
 .direnv/
 result
+
+gg_drive_credentials/
+# Google Drive integration: OAuth tokens live on disk, never in git
+**/gdrive_token*.json

@@ -316,6 +316,18 @@ async def restore_activity_version(
             detail="Version not found",
         )
 
+    # Drive video activities (FR-004 / FR-014): a restore is a write, so the
+    # integration must be ready, and the snapshot may not move the activity to
+    # another Drive file/folder. Imported lazily because activities.py imports
+    # this module for create_activity_version.
+    from src.services.courses.activities.activities import (
+        _enforce_storage_invariant,
+        require_gdrive_ready_for,
+    )
+
+    await require_gdrive_ready_for(activity)
+    _enforce_storage_invariant(activity, {"content": version.content})
+
     # Create a version of the current state before restoring. Unwrap API
     # tokens via resolve_acting_user_id — raw current_user.id is 0 on a
     # token, and created_by_id is an FK to user.id (writing 0 fails).

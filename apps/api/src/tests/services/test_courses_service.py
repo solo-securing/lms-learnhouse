@@ -1852,3 +1852,186 @@ class TestGetUserCoursesAndRights:
             {"blocks": ["old-uuid", "keep-me"]}, uuid_map
         )
         assert result2 == {"blocks": ["new-uuid", "keep-me"]}
+
+
+# ---------------------------------------------------------------------------
+# delete_course + Google Drive video activities (FR-004 gate)
+# ---------------------------------------------------------------------------
+
+from src.services.integrations.gdrive.errors import GDriveNotEnabledError  # noqa: E402
+
+_GDRIVE_READY = "src.services.courses.courses.require_ready"
+
+
+class TestDeleteCourseGDriveGate:
+    @pytest.mark.asyncio
+    async def test_rejected_409_when_not_ready_and_course_kept(
+        self, db, org, course, chapter, gdrive_activity, admin_user, mock_request, bypass_rbac, bypass_webhooks
+    ):
+        with patch(_GDRIVE_READY, new_callable=AsyncMock, side_effect=GDriveNotEnabledError("off")), patch(
+            "src.services.courses.courses.decrease_feature_usage"
+        ) as usage, patch("src.services.courses.courses.delete_storage_directory", create=True) as storage:
+            with pytest.raises(HTTPException) as exc:
+                await delete_course(mock_request, course.course_uuid, admin_user, db)
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "Video : Google Drive storage is not enabled on this instance"
+        assert await db.get(Course, course.id) is not None
+        assert await db.get(Activity, gdrive_activity.id) is not None
+        usage.assert_not_called()
+        storage.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_deletes_when_ready(
+        self, db, org, course, chapter, gdrive_activity, admin_user, mock_request, bypass_rbac, bypass_webhooks
+    ):
+        with patch(_GDRIVE_READY, new_callable=AsyncMock) as ready, patch(
+            "src.services.courses.courses.decrease_feature_usage"
+        ), patch("src.services.courses.courses.delete_storage_directory", create=True):
+            result = await delete_course(mock_request, course.course_uuid, admin_user, db)
+        assert result == {"detail": "Course deleted"}
+        ready.assert_awaited_once()
+        assert await db.get(Course, course.id) is None
+
+    @pytest.mark.asyncio
+    async def test_courses_without_drive_activities_skip_the_gate(
+        self, db, org, course, chapter, activity, admin_user, mock_request, bypass_rbac, bypass_webhooks
+    ):
+        with patch(_GDRIVE_READY, new_callable=AsyncMock, side_effect=GDriveNotEnabledError("off")) as ready, patch(
+            "src.services.courses.courses.decrease_feature_usage"
+        ), patch("src.services.courses.courses.delete_storage_directory", create=True):
+            result = await delete_course(mock_request, course.course_uuid, admin_user, db)
+        assert result == {"detail": "Course deleted"}
+        ready.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# delete_course: Drive course-folder cleanup (best effort, reference-aware)
+# ---------------------------------------------------------------------------
+
+_FIND_COURSE = "src.services.courses.courses.find_course_folder"
+_DEL_COURSE_FOLDER = "src.services.courses.courses.delete_folder_best_effort"
+
+
+class TestDeleteCourseGDriveCleanup:
+    def _common(self):
+        return (
+            patch(_GDRIVE_READY, new_callable=AsyncMock),
+            patch("src.services.courses.courses.decrease_feature_usage"),
+            patch("src.services.courses.courses.delete_storage_directory", create=True),
+        )
+
+    @pytest.mark.asyncio
+    async def test_finds_then_deletes_course_folder(
+        self, db, org, course, chapter, gdrive_activity, admin_user, mock_request, bypass_rbac, bypass_webhooks
+    ):
+        ready, usage, storage = self._common()
+        with ready, usage, storage, patch(_FIND_COURSE, new_callable=AsyncMock, return_value="course_folder_9") as find, patch(
+            _DEL_COURSE_FOLDER, new_callable=AsyncMock, return_value=True
+        ) as delete_folder:
+            result = await delete_course(mock_request, course.course_uuid, admin_user, db)
+        assert result == {"detail": "Course deleted"}
+        find.assert_awaited_once_with(org.org_uuid, course.course_uuid)
+        delete_folder.assert_awaited_once()
+        assert delete_folder.await_args.args[0] == "course_folder_9"
+        assert await db.get(Course, course.id) is None
+
+    @pytest.mark.asyncio
+    async def test_clone_in_other_course_blocks_folder_delete(
+        self, db, org, course, chapter, gdrive_activity, admin_user, mock_request, bypass_rbac, bypass_webhooks, caplog
+    ):
+        import logging as _logging
+
+        clone_course = Course(
+            id=77, name="Clone", description="", public=True, published=True, open_to_contributors=False,
+            org_id=org.id, course_uuid="course_clone", creation_date=str(datetime.now()), update_date=str(datetime.now()),
+        )
+        db.add(clone_course)
+        await db.commit()
+        clone = Activity(
+            id=78, name="clone", activity_type=ActivityTypeEnum.TYPE_VIDEO,
+            activity_sub_type=ActivitySubTypeEnum.SUBTYPE_VIDEO_GDRIVE, content=dict(gdrive_activity.content),
+            org_id=org.id, course_id=77, activity_uuid="activity_clone",
+            creation_date=str(datetime.now()), update_date=str(datetime.now()),
+        )
+        db.add(clone)
+        await db.commit()
+
+        ready, usage, storage = self._common()
+        with ready, usage, storage, patch(_FIND_COURSE, new_callable=AsyncMock) as find, patch(
+            _DEL_COURSE_FOLDER, new_callable=AsyncMock
+        ) as delete_folder, caplog.at_level(_logging.WARNING):
+            result = await delete_course(mock_request, course.course_uuid, admin_user, db)
+        assert result == {"detail": "Course deleted"}
+        find.assert_not_awaited()
+        delete_folder.assert_not_awaited()
+        assert "course_test" in caplog.text and "folder_abc123" in caplog.text and "NOT deleted" in caplog.text
+        assert await db.get(Activity, 78) is not None
+
+    @pytest.mark.asyncio
+    async def test_missing_course_folder_is_skipped(
+        self, db, org, course, chapter, gdrive_activity, admin_user, mock_request, bypass_rbac, bypass_webhooks, caplog
+    ):
+        import logging as _logging
+
+        ready, usage, storage = self._common()
+        with ready, usage, storage, patch(_FIND_COURSE, new_callable=AsyncMock, return_value=None), patch(
+            _DEL_COURSE_FOLDER, new_callable=AsyncMock
+        ) as delete_folder, caplog.at_level(_logging.INFO):
+            result = await delete_course(mock_request, course.course_uuid, admin_user, db)
+        assert result == {"detail": "Course deleted"}
+        delete_folder.assert_not_awaited()
+        assert "nothing to delete" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_budget_exhausted_does_not_block_course_delete(
+        self, db, org, course, chapter, gdrive_activity, admin_user, mock_request, bypass_rbac, bypass_webhooks, caplog, monkeypatch
+    ):
+        """FR-014: the 60 s best-effort budget expiring on Drive never fails the course deletion."""
+        import asyncio
+        import logging as _logging
+
+        import httpx
+
+        from src.services.integrations.gdrive import service as gdrive_service
+        from src.services.integrations.gdrive.client import DriveClient
+
+        monkeypatch.setattr(gdrive_service, "BEST_EFFORT_BUDGET_SECONDS", 0.01)
+
+        async def hang(_request):
+            await asyncio.sleep(1)
+            return httpx.Response(204)
+
+        async def token():
+            return "t"
+
+        def hanging_client():
+            return DriveClient(token, http=httpx.AsyncClient(transport=httpx.MockTransport(hang)))
+
+        ready, usage, storage = self._common()
+        with ready, usage, storage, patch(_FIND_COURSE, new_callable=AsyncMock, return_value="cf"), patch.object(
+            gdrive_service, "_client", hanging_client
+        ), caplog.at_level(_logging.WARNING):
+            result = await delete_course(mock_request, course.course_uuid, admin_user, db)
+        assert result == {"detail": "Course deleted"}
+        assert await db.get(Course, course.id) is None
+        assert "folder cf was not deleted within" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_drive_failure_does_not_block_course_delete(
+        self, db, org, course, chapter, gdrive_activity, admin_user, mock_request, bypass_rbac, bypass_webhooks, caplog
+    ):
+        import logging as _logging
+
+        from src.services.integrations.gdrive import service as gdrive_service
+
+        def failing_client_factory():
+            raise RuntimeError("drive down")
+
+        ready, usage, storage = self._common()
+        with ready, usage, storage, patch(_FIND_COURSE, new_callable=AsyncMock, return_value="cf"), patch.object(
+            gdrive_service, "_client", failing_client_factory
+        ), caplog.at_level(_logging.WARNING):
+            result = await delete_course(mock_request, course.course_uuid, admin_user, db)
+        assert result == {"detail": "Course deleted"}
+        assert await db.get(Course, course.id) is None
+        assert "folder cf was not deleted" in caplog.text

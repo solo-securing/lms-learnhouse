@@ -4,6 +4,7 @@ import {
   getActivityHlsThumbnailsUrl,
   getActivityCaptionUrl,
 } from '@services/media/media'
+import type { GDriveStatus } from '@services/integrations/gdrive'
 
 /**
  * Pure helpers for choosing a video activity's playback source.
@@ -156,4 +157,41 @@ export function resolveActivityCaptions(
       label: l.label || (l.code as string),
       url: getActivityCaptionUrl(ids.orgUuid, ids.courseUuid, ids.activityUuid, l.code as string),
     }))
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Google Drive-stored videos
+// ──────────────────────────────────────────────────────────────────────────
+
+/**
+ * Height (px) of the transparent strip laid over the top of the Drive embed.
+ * Applied via an inline style in Video.tsx; this is the only place the number
+ * lives.
+ */
+export const DRIVE_OVERLAY_HEIGHT_PX = 56
+
+/** True for a video activity whose file lives on the operator's Google Drive. */
+export function isGDriveActivity(
+  activity: { activity_sub_type?: string } | null | undefined
+): boolean {
+  return activity?.activity_sub_type === 'SUBTYPE_VIDEO_GDRIVE'
+}
+
+const DRIVE_FILE_ID_RE = /^[A-Za-z0-9_-]+$/
+
+/**
+ * The embed URL for a Drive-stored video, or null for anything that is not a
+ * plain Drive file id. This is the ONLY place the client builds a Drive URL,
+ * and the result may only ever be used as an iframe `src` — never as a link.
+ */
+export function resolveDrivePreviewUrl(fileId: string | null | undefined): string | null {
+  if (typeof fileId !== 'string' || !DRIVE_FILE_ID_RE.test(fileId)) return null
+  return `https://drive.google.com/file/d/${fileId}/preview`
+}
+
+/** Where a new video upload goes by default: Drive only once it is confirmed ready. */
+export function defaultVideoStorage(
+  status: GDriveStatus | null | undefined
+): 'server' | 'gdrive' {
+  return status?.ready === true ? 'gdrive' : 'server'
 }

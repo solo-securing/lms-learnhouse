@@ -37,3 +37,7 @@ node_modules
 
 # Runtime output
 logs
+
+# Google Drive integration (credential + token files never ship in the image)
+gg_drive_credentials/
+**/gdrive_token*.json

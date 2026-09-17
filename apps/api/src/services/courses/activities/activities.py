@@ -3,7 +3,7 @@ from sqlmodel import select
 from sqlmodel.ext.asyncio.session import AsyncSession
 from src.db.courses.courses import Course
 from src.db.courses.chapters import Chapter
-from src.db.courses.activities import ActivityCreate, Activity, ActivityRead, ActivityUpdate
+from src.db.courses.activities import ActivityCreate, Activity, ActivityRead, ActivitySubTypeEnum, ActivityUpdate
 from src.db.courses.chapter_activities import ChapterActivity
 from src.db.organizations import Organization, OrganizationRead
 from src.db.organization_config import OrganizationConfig
@@ -18,6 +18,9 @@ import asyncio
 import logging
 
 from src.core.ee_hooks import check_ee_activity_paid_access
+from src.services.integrations.gdrive.errors import GDriveError, to_http_exception
+from src.services.integrations.gdrive.readiness import require_ready
+from src.services.integrations.gdrive.service import delete_folder_best_effort, has_other_reference
 from src.security.rbac import check_resource_access, AccessAction
 from src.services.courses.activities.versioning import create_activity_version
 from src.services.courses.locks import (
@@ -31,6 +34,63 @@ logger = logging.getLogger(__name__)
 # Module-level set to hold strong references to background embedding tasks,
 # preventing them from being garbage-collected before they complete.
 _embedding_tasks: set = set()
+
+
+STORAGE_CHANGE_DETAIL = "Video : Storage location of a video activity cannot be changed"
+GDRIVE_CREATE_DETAIL = "Video : Google Drive video activities must be created through POST /activities/video"
+_GDRIVE_CONTENT_KEYS = ("gdrive_file_id", "gdrive_folder_id", "mime_type", "size", "original_filename")
+
+
+def _sub_type_value(value) -> str | None:
+    if value is None:
+        return None
+    return str(getattr(value, "value", value))
+
+
+def is_gdrive_activity(activity: Activity) -> bool:
+    return _sub_type_value(activity.activity_sub_type) == ActivitySubTypeEnum.SUBTYPE_VIDEO_GDRIVE.value
+
+
+async def require_gdrive_ready_for(activity: Activity) -> None:
+    """FR-004: every write to a Drive video activity needs the integration ready.
+
+    Translates the readiness error into the fixed 409 "Video : ..." reply so
+    nothing downstream changes when the operator has the integration off,
+    unconfigured or in need of re-authorization.
+    """
+    if not is_gdrive_activity(activity):
+        return
+    try:
+        await require_ready()
+    except GDriveError as err:
+        raise to_http_exception(err)
+
+
+def _enforce_storage_invariant(activity: Activity, update_data: dict) -> None:
+    """FR-014: the storage location of a video activity never changes.
+
+    ``ActivityUpdate`` accepts both ``activity_sub_type`` and ``content``, so a
+    generic PUT could otherwise flip a Drive activity to hosted (or vice versa)
+    or rewrite the Drive ids under it.
+    """
+    requested_sub = _sub_type_value(update_data.get("activity_sub_type"))
+    gdrive = ActivitySubTypeEnum.SUBTYPE_VIDEO_GDRIVE.value
+    if is_gdrive_activity(activity):
+        if "activity_sub_type" in update_data and requested_sub != gdrive:
+            raise HTTPException(status_code=409, detail=STORAGE_CHANGE_DETAIL)
+        if "content" in update_data:
+            new_content = update_data["content"]
+            if not isinstance(new_content, dict):
+                # ``content: null`` (or any non-object) would wipe the Drive ids.
+                raise HTTPException(status_code=409, detail=STORAGE_CHANGE_DETAIL)
+            current = activity.content or {}
+            if new_content.get("storage") != "gdrive":
+                raise HTTPException(status_code=409, detail=STORAGE_CHANGE_DETAIL)
+            for key in _GDRIVE_CONTENT_KEYS:
+                if new_content.get(key) != current.get(key):
+                    raise HTTPException(status_code=409, detail=STORAGE_CHANGE_DETAIL)
+    elif "activity_sub_type" in update_data and requested_sub == gdrive:
+        raise HTTPException(status_code=409, detail=STORAGE_CHANGE_DETAIL)
 
 
 ####################################################
@@ -66,6 +126,11 @@ async def create_activity(
         )
 
     await check_resource_access(request, db_session, current_user, course.course_uuid, AccessAction.CREATE)
+
+    # A Drive video only exists once its file is on Drive (FR-011); the generic
+    # endpoint cannot upload, so it must never mint one — ready or not (FR-004).
+    if _sub_type_value(activity_object.activity_sub_type) == ActivitySubTypeEnum.SUBTYPE_VIDEO_GDRIVE.value:
+        raise HTTPException(status_code=409, detail=GDRIVE_CREATE_DETAIL)
 
     # Create Activity
     activity = Activity(**activity_object.model_dump())
@@ -388,6 +453,11 @@ async def update_activity(
     # Using model_dump(exclude_unset=True) to get only the fields that were passed in
     update_data = activity_object.model_dump(exclude_unset=True)
 
+    # Drive video activities: readiness gate (FR-004) + storage invariant
+    # (FR-014) BEFORE anything is mutated.
+    await require_gdrive_ready_for(activity)
+    _enforce_storage_invariant(activity, update_data)
+
     # Create a version snapshot before updating content
     # This preserves the current state for version history.
     # resolve_acting_user_id unwraps APITokenUser → the creating human's id,
@@ -477,6 +547,10 @@ async def delete_activity(
 
     await check_resource_access(request, db_session, current_user, course.course_uuid, AccessAction.DELETE)
 
+    # Drive video activities are only deleted while the integration can also
+    # clean up the Drive folder (FR-004): not ready → 409, nothing changes.
+    await require_gdrive_ready_for(activity)
+
     # Clean up content files from storage
     from src.db.organizations import Organization
     org_statement = select(Organization).where(Organization.id == course.org_id)
@@ -498,9 +572,28 @@ async def delete_activity(
             detail="Activity not found in chapter",
         )
 
+    # Remember what to clean up on Drive before the row is gone. content is
+    # copied verbatim by clone_course, so the folder may still be shared.
+    gdrive_folder_id = activity.content.get("gdrive_folder_id") if is_gdrive_activity(activity) and activity.content else None
+    activity_id = activity.id
+    user_id = resolve_acting_user_id(current_user) if not isinstance(current_user, AnonymousUser) else None
+
     await db_session.delete(activity_chapter)
     await db_session.delete(activity)
     await db_session.commit()
+
+    if gdrive_folder_id:
+        # FR-013: name the org too, so a "delete it by hand" WARNING is actionable.
+        context = (
+            f"user={user_id} org={org.org_uuid if org else None} course={course.course_uuid} "
+            f"activity={activity_uuid} folder={gdrive_folder_id}"
+        )
+        if await has_other_reference(db_session, activity_id, gdrive_folder_id=gdrive_folder_id):
+            logger.info("Drive folder kept: still referenced by another activity (%s)", context)
+        else:
+            # Best effort: a Drive failure here is logged, never blocks the delete.
+            await delete_folder_best_effort(gdrive_folder_id, context=context)
+        logger.info("Drive video activity deleted (%s) result=ok", context)
 
     return {"detail": "Activity deleted"}
 

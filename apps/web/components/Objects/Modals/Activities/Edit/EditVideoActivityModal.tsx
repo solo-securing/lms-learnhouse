@@ -9,13 +9,16 @@ import CaptionsSettings, {
 } from '@components/Objects/Activities/Video/CaptionsSettings'
 import {
   getActivity,
+  updateGDriveVideoActivity,
   updateHostedVideoActivity,
   updateExternalVideoActivity,
   updateVideoCaptions,
 } from '@services/courses/activities'
+import { isGDriveActivity } from '@components/Objects/Activities/Video/videoSource'
 import { useLHSession } from '@components/Contexts/LHSessionContext'
 import toast from 'react-hot-toast'
 import { mutate } from 'swr'
+import { useTranslation } from 'react-i18next'
 
 const SUPPORTED_FILES = constructAcceptValue(['mp4', 'webm'])
 
@@ -37,10 +40,19 @@ function EditVideoActivityModal({ activity, onClose }: EditVideoActivityModalPro
   const session = useLHSession() as any
   const access_token = session?.data?.tokens?.access_token
   const isYouTube = activity.activity_sub_type === 'SUBTYPE_VIDEO_YOUTUBE'
+  // A Drive-stored video: only its name and file can change. The storage
+  // location itself is fixed for the lifetime of the activity.
+  const isGDrive = isGDriveActivity(activity)
+  const { t } = useTranslation()
 
   const [name, setName] = useState(activity.name || '')
   const [youtubeUrl, setYoutubeUrl] = useState('')
   const [videoFile, setVideoFile] = useState<File | null>(null)
+  const [originalFilename, setOriginalFilename] = useState<string>(
+    typeof activity?.content?.original_filename === 'string'
+      ? activity.content.original_filename
+      : ''
+  )
   const [videoDetails, setVideoDetails] = useState<VideoDetails>({
     startTime: 0,
     endTime: null,
@@ -68,6 +80,9 @@ function EditVideoActivityModal({ activity, onClose }: EditVideoActivityModalPro
       }
       if (data?.content?.uri) {
         setYoutubeUrl(data.content.uri)
+      }
+      if (typeof data?.content?.original_filename === 'string') {
+        setOriginalFilename(data.content.original_filename)
       }
       const caps = data?.extra_metadata?.captions
       if (caps) {
@@ -140,6 +155,12 @@ function EditVideoActivityModal({ activity, onClose }: EditVideoActivityModalPro
           access_token,
           name !== activity.name ? name : undefined,
         )
+      } else if (isGDrive) {
+        res = await updateGDriveVideoActivity(
+          activity.activity_uuid,
+          { name: name !== activity.name ? name : undefined, videoFile },
+          access_token,
+        )
       } else {
         res = await updateHostedVideoActivity(
           activity.activity_uuid,
@@ -151,7 +172,10 @@ function EditVideoActivityModal({ activity, onClose }: EditVideoActivityModalPro
       }
 
       if (res?.success === false) {
-        toast.error('Failed to update video activity', { id: toastId })
+        // The Drive backend answers with actionable "Video : ..." messages.
+        const detail =
+          isGDrive && typeof res?.data?.detail === 'string' ? res.data.detail : null
+        toast.error(detail || 'Failed to update video activity', { id: toastId })
       } else {
         toast.success('Video activity updated', { id: toastId })
         mutate((key: string) => typeof key === 'string' && key.includes('/courses/org_slug/'))
@@ -183,7 +207,11 @@ function EditVideoActivityModal({ activity, onClose }: EditVideoActivityModalPro
       >
         <span className="flex items-center gap-2 bg-white nice-shadow rounded-full px-4 py-1.5 text-sm font-medium text-gray-600">
           <PlayCircle size={18} weight="duotone" className="text-violet-400" />
-          {isYouTube ? 'YouTube Video' : 'Hosted Video'}
+          {isYouTube
+            ? 'YouTube Video'
+            : isGDrive
+              ? t('activities.video_gdrive.label')
+              : 'Hosted Video'}
         </span>
       </div>
 
@@ -216,12 +244,46 @@ function EditVideoActivityModal({ activity, onClose }: EditVideoActivityModalPro
               className="w-full h-9 px-3 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors"
             />
           </div>
+        ) : isGDrive ? (
+          <div className="space-y-3">
+            <div className="space-y-1 text-xs text-gray-500">
+              <p>
+                <span className="font-medium text-gray-700">
+                  {t('activities.video_gdrive.storage_location')}:
+                </span>{' '}
+                {t('activities.video_gdrive.storage_gdrive')}
+              </p>
+              {originalFilename ? (
+                <p className="break-all">
+                  <span className="font-medium text-gray-700">
+                    {t('activities.video_gdrive.original_file')}:
+                  </span>{' '}
+                  {originalFilename}
+                </p>
+              ) : null}
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-sm font-medium text-gray-700">
+                {t('activities.video_gdrive.replace_video')}
+              </label>
+              <div className="flex items-center gap-2 text-xs text-gray-400 mb-1">
+                <Upload size={14} weight="duotone" />
+                <span>{t('activities.video_gdrive.replace_hint')}</span>
+              </div>
+              <input
+                type="file"
+                accept={SUPPORTED_FILES}
+                onChange={(e) => setVideoFile(e.target.files?.[0] ?? null)}
+                className="w-full text-sm text-gray-500 file:me-3 file:py-1.5 file:px-3 file:rounded-full file:border-0 file:text-xs file:font-medium file:bg-gray-100 file:text-gray-700 hover:file:bg-gray-200 transition-colors"
+              />
+            </div>
+          </div>
         ) : (
           <div className="space-y-1.5">
             <label className="text-sm font-medium text-gray-700">Replace video file</label>
             <div className="flex items-center gap-2 text-xs text-gray-400 mb-1">
               <Upload size={14} weight="duotone" />
-              <span>Leave empty to keep the current video</span>
+              <span>{t('activities.video_gdrive.replace_hint')}</span>
             </div>
             <input
               type="file"
@@ -233,109 +295,111 @@ function EditVideoActivityModal({ activity, onClose }: EditVideoActivityModalPro
         )}
       </div>
 
-      <div className="rounded-xl nice-shadow p-4 space-y-4">
-        <h3 className="text-sm font-medium text-gray-700">Video Settings</h3>
-        <div className="grid grid-cols-2 gap-4">
-          <div className="space-y-1.5">
-            <label className="text-xs font-medium text-gray-500">Start Time</label>
-            <div className="flex gap-2">
-              <div className="flex-1">
-                <input
-                  type="number"
-                  min="0"
-                  value={startTimeParts.minutes}
-                  onChange={(e) => {
-                    const minutes = Math.max(0, parseInt(e.target.value) || 0)
-                    setVideoDetails({ ...videoDetails, startTime: convertToSeconds(minutes, startTimeParts.seconds) })
-                  }}
-                  placeholder="0"
-                  className="w-full h-9 px-3 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors"
-                />
-                <span className="text-[11px] text-gray-400 mt-0.5 block">Min</span>
+      {!isGDrive && (
+        <div className="rounded-xl nice-shadow p-4 space-y-4">
+          <h3 className="text-sm font-medium text-gray-700">Video Settings</h3>
+          <div className="grid grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-gray-500">Start Time</label>
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <input
+                    type="number"
+                    min="0"
+                    value={startTimeParts.minutes}
+                    onChange={(e) => {
+                      const minutes = Math.max(0, parseInt(e.target.value) || 0)
+                      setVideoDetails({ ...videoDetails, startTime: convertToSeconds(minutes, startTimeParts.seconds) })
+                    }}
+                    placeholder="0"
+                    className="w-full h-9 px-3 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors"
+                  />
+                  <span className="text-[11px] text-gray-400 mt-0.5 block">Min</span>
+                </div>
+                <div className="flex-1">
+                  <input
+                    type="number"
+                    min="0"
+                    max="59"
+                    value={startTimeParts.seconds}
+                    onChange={(e) => {
+                      const seconds = Math.max(0, Math.min(59, parseInt(e.target.value) || 0))
+                      setVideoDetails({ ...videoDetails, startTime: convertToSeconds(startTimeParts.minutes, seconds) })
+                    }}
+                    placeholder="0"
+                    className="w-full h-9 px-3 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors"
+                  />
+                  <span className="text-[11px] text-gray-400 mt-0.5 block">Sec</span>
+                </div>
               </div>
-              <div className="flex-1">
-                <input
-                  type="number"
-                  min="0"
-                  max="59"
-                  value={startTimeParts.seconds}
-                  onChange={(e) => {
-                    const seconds = Math.max(0, Math.min(59, parseInt(e.target.value) || 0))
-                    setVideoDetails({ ...videoDetails, startTime: convertToSeconds(startTimeParts.minutes, seconds) })
-                  }}
-                  placeholder="0"
-                  className="w-full h-9 px-3 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors"
-                />
-                <span className="text-[11px] text-gray-400 mt-0.5 block">Sec</span>
+            </div>
+
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-gray-500">End Time (optional)</label>
+              <div className="flex gap-2">
+                <div className="flex-1">
+                  <input
+                    type="number"
+                    min="0"
+                    value={endTimeParts.minutes}
+                    onChange={(e) => {
+                      const minutes = Math.max(0, parseInt(e.target.value) || 0)
+                      const totalSeconds = convertToSeconds(minutes, endTimeParts.seconds)
+                      if (totalSeconds > videoDetails.startTime) {
+                        setVideoDetails({ ...videoDetails, endTime: totalSeconds })
+                      }
+                    }}
+                    placeholder="0"
+                    className="w-full h-9 px-3 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors"
+                  />
+                  <span className="text-[11px] text-gray-400 mt-0.5 block">Min</span>
+                </div>
+                <div className="flex-1">
+                  <input
+                    type="number"
+                    min="0"
+                    max="59"
+                    value={endTimeParts.seconds}
+                    onChange={(e) => {
+                      const seconds = Math.max(0, Math.min(59, parseInt(e.target.value) || 0))
+                      const totalSeconds = convertToSeconds(endTimeParts.minutes, seconds)
+                      if (totalSeconds > videoDetails.startTime) {
+                        setVideoDetails({ ...videoDetails, endTime: totalSeconds })
+                      }
+                    }}
+                    placeholder="0"
+                    className="w-full h-9 px-3 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors"
+                  />
+                  <span className="text-[11px] text-gray-400 mt-0.5 block">Sec</span>
+                </div>
               </div>
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <label className="text-xs font-medium text-gray-500">End Time (optional)</label>
-            <div className="flex gap-2">
-              <div className="flex-1">
-                <input
-                  type="number"
-                  min="0"
-                  value={endTimeParts.minutes}
-                  onChange={(e) => {
-                    const minutes = Math.max(0, parseInt(e.target.value) || 0)
-                    const totalSeconds = convertToSeconds(minutes, endTimeParts.seconds)
-                    if (totalSeconds > videoDetails.startTime) {
-                      setVideoDetails({ ...videoDetails, endTime: totalSeconds })
-                    }
-                  }}
-                  placeholder="0"
-                  className="w-full h-9 px-3 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors"
-                />
-                <span className="text-[11px] text-gray-400 mt-0.5 block">Min</span>
-              </div>
-              <div className="flex-1">
-                <input
-                  type="number"
-                  min="0"
-                  max="59"
-                  value={endTimeParts.seconds}
-                  onChange={(e) => {
-                    const seconds = Math.max(0, Math.min(59, parseInt(e.target.value) || 0))
-                    const totalSeconds = convertToSeconds(endTimeParts.minutes, seconds)
-                    if (totalSeconds > videoDetails.startTime) {
-                      setVideoDetails({ ...videoDetails, endTime: totalSeconds })
-                    }
-                  }}
-                  placeholder="0"
-                  className="w-full h-9 px-3 text-sm rounded-lg bg-gray-50 border border-gray-200 outline-none focus:border-gray-300 focus:ring-1 focus:ring-gray-200 transition-colors"
-                />
-                <span className="text-[11px] text-gray-400 mt-0.5 block">Sec</span>
-              </div>
-            </div>
+          <div className="flex items-center gap-5 pt-1">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={videoDetails.autoplay}
+                onChange={(e) => setVideoDetails({ ...videoDetails, autoplay: e.target.checked })}
+                className="rounded border-gray-300 text-black focus:ring-black"
+              />
+              <span className="text-sm text-gray-600">Autoplay</span>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={videoDetails.muted}
+                onChange={(e) => setVideoDetails({ ...videoDetails, muted: e.target.checked })}
+                className="rounded border-gray-300 text-black focus:ring-black"
+              />
+              <span className="text-sm text-gray-600">Start muted</span>
+            </label>
           </div>
         </div>
+      )}
 
-        <div className="flex items-center gap-5 pt-1">
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={videoDetails.autoplay}
-              onChange={(e) => setVideoDetails({ ...videoDetails, autoplay: e.target.checked })}
-              className="rounded border-gray-300 text-black focus:ring-black"
-            />
-            <span className="text-sm text-gray-600">Autoplay</span>
-          </label>
-          <label className="flex items-center gap-2 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={videoDetails.muted}
-              onChange={(e) => setVideoDetails({ ...videoDetails, muted: e.target.checked })}
-              className="rounded border-gray-300 text-black focus:ring-black"
-            />
-            <span className="text-sm text-gray-600">Start muted</span>
-          </label>
-        </div>
-      </div>
-
-      {!isYouTube && (
+      {!isYouTube && !isGDrive && (
         <div className="space-y-2">
           <CaptionsSettings value={captions} onChange={setCaptions} status={capStatus} />
           <div className="flex justify-end">

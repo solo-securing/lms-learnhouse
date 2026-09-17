@@ -13,6 +13,7 @@ dependencies = [
     "fastapi==0.141.1",
     "httpx==0.28.1",
     "google-genai==2.22.0",
+    "google-auth-oauthlib==1.4.1",
     "pydantic-ai-slim[openai,anthropic,google,mistral]==2.38.0",
     "pwdlib[argon2]==0.3.1",
     "psycopg2-binary==2.9.12",

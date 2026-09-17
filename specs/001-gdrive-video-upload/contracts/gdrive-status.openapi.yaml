@@ -1,0 +1,57 @@
+openapi: 3.1.0
+info:
+  title: LearnHouse — Google Drive integration status
+  version: 1.0.0
+paths:
+  /api/v1/integrations/gdrive/status:
+    get:
+      summary: Trạng thái sẵn sàng của tích hợp Google Drive (cấp instance)
+      description: |
+        Dùng bởi hộp thoại tạo Activity video để quyết định có hiển thị lựa chọn
+        "Nơi lưu trữ" hay không. Yêu cầu người dùng đã đăng nhập (mọi vai trò).
+        Không trả về email tài khoản Drive, đường dẫn file hay bất kỳ bí mật nào.
+        Kết quả kiểm tra mạng được cache trong tiến trình tối đa 300 giây.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Trạng thái hiện tại
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GDriveStatus"
+              examples:
+                ready:
+                  value: { enabled: true, ready: true, reason: null }
+                disabled:
+                  value: { enabled: false, ready: false, reason: "disabled" }
+                needs_reauth:
+                  value: { enabled: true, ready: false, reason: "needs_reauthorization" }
+        "401":
+          description: Chưa đăng nhập
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    GDriveStatus:
+      type: object
+      required: [enabled, ready, reason]
+      properties:
+        enabled:
+          type: boolean
+          description: Cờ cấu hình LEARNHOUSE_GDRIVE_ENABLED
+        ready:
+          type: boolean
+          description: enabled AND credential đọc được AND token có refresh_token AND access token dùng được
+        reason:
+          type: [string, "null"]
+          enum:
+            - disabled
+            - credentials_missing
+            - credentials_invalid
+            - token_missing
+            - needs_reauthorization
+            - network_error
+            - null

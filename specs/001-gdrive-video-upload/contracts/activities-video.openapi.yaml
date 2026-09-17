@@ -1,0 +1,147 @@
+openapi: 3.1.0
+info:
+  title: LearnHouse — Video activity endpoints (mở rộng cho Google Drive)
+  version: 1.0.0
+paths:
+  /api/v1/activities/video:
+    post:
+      summary: Tạo Activity video (máy chủ hoặc Google Drive)
+      description: |
+        Mở rộng endpoint hiện có bằng trường form `storage`. Với `storage=gdrive`
+        máy chủ nhận file, đẩy lên Google Drive đồng bộ trong cùng request, đặt
+        quyền chia sẻ, xác nhận, rồi mới tạo Activity. Thất bại ở bất kỳ bước nào
+        → không tạo Activity, không để lại file trên Drive.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [name, chapter_id, video_file]
+              properties:
+                name: { type: string }
+                chapter_id: { type: integer }
+                video_file:
+                  type: string
+                  format: binary
+                  description: mp4 hoặc webm, tối đa 5 GiB
+                storage:
+                  type: string
+                  enum: [server, gdrive]
+                  default: server
+                details:
+                  type: string
+                  description: JSON thiết lập phát; BỎ QUA khi storage=gdrive (details lưu {})
+                extra_metadata:
+                  type: string
+                  description: JSON object; không đổi
+      responses:
+        "200":
+          description: Activity đã tạo (ActivityRead). Với gdrive, `activity_sub_type = SUBTYPE_VIDEO_GDRIVE`, `content` theo contracts/drive-content.md
+        "401":
+          description: 'Chưa đăng nhập'
+        "403":
+          description: 'Không có quyền tạo trong chương'
+        "404":
+          description: 'Chapter / CourseChapter / Course không tồn tại'
+        "409":
+          description: |
+            - "Video : No video file provided" / "Video : Wrong video format" (hiện có)
+            - "Video : Google Drive storage is not enabled on this instance" (cờ tắt hoặc thiếu credential/token)
+            - "Video : Google Drive needs re-authorization by the operator" (invalid_grant)
+            - "Video : Google Drive is not configured correctly" (credential JSON hỏng)
+        "413":
+          description: 'File vượt 5 GiB (nginx hoặc validator)'
+        "415":
+          description: 'Magic bytes không phải mp4/webm'
+        "422":
+          description: 'storage không thuộc {server, gdrive}, hoặc details/extra_metadata không phải JSON object'
+        "502":
+          description: |
+            - "Video : Google Drive is unreachable, please try again" (mạng / 5xx sau retry / session mất)
+            - "Video : Could not set sharing on the Google Drive file" (permission / verify thất bại; file đã bị xoá)
+        "507":
+          description: '"Video : Google Drive is out of storage space"'
+  /api/v1/activities/video/{activity_uuid}:
+    put:
+      summary: Cập nhật Activity video (chữ ký không đổi; rẽ nhánh theo subtype)
+      description: |
+        - SUBTYPE_VIDEO_HOSTED: hành vi hiện có (name, start_time, end_time, autoplay, muted, video_file).
+        - SUBTYPE_VIDEO_GDRIVE: chỉ `name` và `video_file` có tác dụng; các trường thiết lập phát bị bỏ qua.
+          MỌI cập nhật (kể cả chỉ đổi `name`, không kèm file) yêu cầu tích hợp sẵn sàng (FR-004);
+          khi không sẵn sàng → 409 với cùng thông điệp Drive như POST, không thay đổi gì.
+          Khi có `video_file`: đẩy file mới vào thư mục activity trên Drive,
+          cập nhật `content`, xoá file cũ (best-effort, chỉ khi không Activity nào khác tham chiếu).
+          Nơi lưu trữ không bao giờ đổi (không chuyển Drive ↔ máy chủ ↔ YouTube).
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: activity_uuid
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                video_file: { type: string, format: binary }
+                start_time: { type: integer, description: bỏ qua với gdrive }
+                end_time: { type: integer, description: bỏ qua với gdrive }
+                autoplay: { type: string, description: bỏ qua với gdrive }
+                muted: { type: string, description: bỏ qua với gdrive }
+      responses:
+        "200":
+          description: 'ActivityRead đã cập nhật'
+        "401":
+          description: 'Chưa đăng nhập'
+        "403":
+          description: 'Không có quyền cập nhật'
+        "404":
+          description: 'Activity / Course không tồn tại'
+        "409":
+          description: 'Cùng các thông điệp Drive như POST; "Video : Wrong video format"'
+        "502":
+          description: 'Cùng POST'
+        "507":
+          description: 'Cùng POST'
+  /api/v1/activities/{activity_uuid}:
+    put:
+      summary: Cập nhật chung Activity (hành vi bổ sung cho Drive)
+      description: |
+        Không đổi chữ ký (name, published, ...). Với SUBTYPE_VIDEO_GDRIVE: yêu cầu tích hợp
+        sẵn sàng (FR-004); khi không sẵn sàng → 409 "Video : Google Drive storage is not enabled
+        on this instance" (hoặc "needs re-authorization"), không thay đổi gì. Các subtype khác không đổi.
+        Bất biến nơi lưu trữ (FR-014): với Activity Drive, body chứa `activity_sub_type` khác
+        SUBTYPE_VIDEO_GDRIVE, hoặc `content` đổi `storage`/`gdrive_file_id`/`gdrive_folder_id`/
+        `mime_type`/`size`/`original_filename` → 409 "Video : Storage location of a video activity
+        cannot be changed", không thay đổi gì. Với Activity không phải Drive, body đặt
+        `activity_sub_type = SUBTYPE_VIDEO_GDRIVE` → cùng 409. Sắp xếp lại thứ tự trong chương
+        (endpoint chapters) không bị ảnh hưởng.
+      responses:
+        "200":
+          description: 'ActivityRead đã cập nhật'
+        "409":
+          description: 'Activity Drive nhưng tích hợp không sẵn sàng; hoặc yêu cầu đổi nơi lưu trữ / ghi đè trường Drive'
+    delete:
+      summary: Xoá Activity (hành vi bổ sung cho Drive)
+      description: |
+        Không đổi chữ ký. Với SUBTYPE_VIDEO_GDRIVE: yêu cầu tích hợp sẵn sàng (FR-004); khi không
+        sẵn sàng → 409, Activity KHÔNG bị xoá. Khi sẵn sàng: sau khi dọn storage máy chủ, xoá thư mục
+        activity trên Drive theo nỗ lực tốt nhất (chỉ khi không Activity khác tham chiếu);
+        lỗi Drive lúc này được ghi log và KHÔNG chặn việc xoá Activity.
+        Xoá khoá học (service) chứa Activity Drive tuân cùng quy tắc: từ chối 409 khi không sẵn sàng.
+      responses:
+        "200":
+          description: 'Đã xoá'
+        "409":
+          description: 'Activity Drive nhưng tích hợp không sẵn sàng; không xoá'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer

@@ -972,6 +972,19 @@
   },
   "activities": {
     "video": "فيديو",
+    "video_gdrive": {
+      "storage_location": "مكان التخزين",
+      "storage_server": "الخادم",
+      "storage_gdrive": "Google Drive",
+      "storage_warning": "يُخزَّن الملف على Google Drive الشخصي لمشغّل المنصة. يمكن لأي شخص لديه الرابط مشاهدته؛ التنزيل معطّل لكن لا يمكن منع تسجيل الشاشة.",
+      "uploading_to_drive": "جارٍ الرفع إلى Google Drive…",
+      "label": "فيديو Google Drive",
+      "original_file": "الملف الأصلي",
+      "replace_video": "استبدال الفيديو",
+      "replace_hint": "اتركه فارغًا للاحتفاظ بالفيديو الحالي",
+      "embed_hint": "إذا لم يظهر الفيديو، فاسمح بالمحتوى المضمّن من جهات خارجية في متصفحك.",
+      "storage_change_error": "لا يمكن تغيير مكان تخزين نشاط الفيديو."
+    },
     "document": "مستند",
     "page": "صفحة",
     "assignment": "واجب",

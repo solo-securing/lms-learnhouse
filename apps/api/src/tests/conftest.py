@@ -36,6 +36,20 @@ os.environ["LEARNHOUSE_DISABLE_EE"] = "1"
 # and nowhere else. Tests that need the feature on enable it themselves.
 os.environ["LEARNHOUSE_DEMO_ENABLED"] = "0"
 
+# Pin the Google Drive integration OFF for the whole suite.
+#
+# Readiness is computed from env/config at call time, so a developer with
+# LEARNHOUSE_GDRIVE_ENABLED=true in apps/api/.env (loaded by config.py's
+# load_dotenv) would otherwise see the status endpoint report "ready" and the
+# 409 readiness gates silently pass. Tests that exercise the integration set
+# the variables themselves (monkeypatch) and reset the readiness cache.
+# An empty string reads as "unset" in config.py, and plain assignments keep
+# ruff's E402 exemption for pre-import environment setup.
+os.environ["LEARNHOUSE_GDRIVE_ENABLED"] = "false"
+os.environ["LEARNHOUSE_GDRIVE_CREDENTIALS_PATH"] = ""
+os.environ["LEARNHOUSE_GDRIVE_TOKEN_PATH"] = ""
+os.environ["LEARNHOUSE_GDRIVE_ROOT_FOLDER_NAME"] = ""
+
 # Set a valid JWT secret key for tests (must be at least 32 characters)
 os.environ["LEARNHOUSE_AUTH_JWT_SECRET_KEY"] = (
     "test-secret-key-for-unit-tests-32chars!"
@@ -521,3 +535,101 @@ def bypass_analytics():
         new_callable=AsyncMock,
     ) as mock:
         yield mock
+
+
+async def _linked_video_activity(db, org, course, chapter, *, id, order, name, sub_type, activity_uuid, content):
+    """Build a published TYPE_VIDEO activity of ``sub_type`` linked to the test chapter."""
+    a = Activity(
+        id=id,
+        name=name,
+        activity_type=ActivityTypeEnum.TYPE_VIDEO,
+        activity_sub_type=sub_type,
+        content=content,
+        details={},
+        published=True,
+        org_id=org.id,
+        course_id=course.id,
+        activity_uuid=activity_uuid,
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
+    )
+    db.add(a)
+    await db.commit()
+    await db.refresh(a)
+    link = ChapterActivity(
+        order=order,
+        chapter_id=chapter.id,
+        activity_id=a.id,
+        course_id=course.id,
+        org_id=org.id,
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
+    )
+    db.add(link)
+    await db.commit()
+    return a
+
+
+@pytest.fixture
+async def hosted_activity(db, org, course, chapter):
+    """A published self-hosted video activity (FR-014 control case next to the Drive one)."""
+    return await _linked_video_activity(
+        db, org, course, chapter,
+        id=3, order=3, name="Hosted Video",
+        sub_type=ActivitySubTypeEnum.SUBTYPE_VIDEO_HOSTED, activity_uuid="activity_hosted",
+        content={"activity_uuid": "activity_hosted", "filename": "video.mp4", "mime_type": "video/mp4", "size": 4321},
+    )
+
+
+@pytest.fixture
+async def youtube_activity(db, org, course, chapter):
+    """A published YouTube video activity (FR-014 control case next to the Drive one)."""
+    return await _linked_video_activity(
+        db, org, course, chapter,
+        id=4, order=4, name="YouTube Video",
+        sub_type=ActivitySubTypeEnum.SUBTYPE_VIDEO_YOUTUBE, activity_uuid="activity_youtube",
+        content={"uri": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"},
+    )
+
+
+
+@pytest.fixture
+async def gdrive_activity(db, org, course, chapter):
+    """A published Google Drive video activity linked to the test chapter."""
+    a = Activity(
+        id=2,
+        name="Drive Video",
+        activity_type=ActivityTypeEnum.TYPE_VIDEO,
+        activity_sub_type=ActivitySubTypeEnum.SUBTYPE_VIDEO_GDRIVE,
+        content={
+            "activity_uuid": "activity_gdrive",
+            "storage": "gdrive",
+            "gdrive_file_id": "file_abc123",
+            "gdrive_folder_id": "folder_abc123",
+            "original_filename": "lesson-1.mp4",
+            "mime_type": "video/mp4",
+            "size": 1234,
+        },
+        details={},
+        published=True,
+        org_id=org.id,
+        course_id=course.id,
+        activity_uuid="activity_gdrive",
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
+    )
+    db.add(a)
+    await db.commit()
+    await db.refresh(a)
+    link = ChapterActivity(
+        order=2,
+        chapter_id=chapter.id,
+        activity_id=a.id,
+        course_id=course.id,
+        org_id=org.id,
+        creation_date=str(datetime.now()),
+        update_date=str(datetime.now()),
+    )
+    db.add(link)
+    await db.commit()
+    return a

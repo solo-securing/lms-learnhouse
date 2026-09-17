@@ -28,28 +28,87 @@ export async function createActivity(
  * report upload progress). Resolves with the created activity JSON. Used by the
  * background-upload flow so the modal can close immediately.
  */
+export type VideoStorage = 'server' | 'gdrive'
+
+export interface VideoFormFieldsArgs {
+  name: string
+  chapterId: string | number
+  storage?: VideoStorage
+  details?: {
+    startTime?: number
+    endTime?: number | null
+    autoplay?: boolean
+    muted?: boolean
+  } | null
+  extraMetadata?: Record<string, unknown> | null
+}
+
+/**
+ * Pure: the multipart fields (excluding the file itself) for POST
+ * /activities/video. Playback `details` only apply to server-hosted videos —
+ * a Google Drive upload ignores them server-side, so they are never sent.
+ */
+export function buildVideoFormFields(args: VideoFormFieldsArgs): Array<[string, string]> {
+  const fields: Array<[string, string]> = [
+    ['chapter_id', String(args.chapterId)],
+    ['name', args.name],
+  ]
+  if (args.storage) fields.push(['storage', args.storage])
+  if (args.storage !== 'gdrive' && args.details) {
+    fields.push([
+      'details',
+      JSON.stringify({
+        startTime: args.details.startTime || 0,
+        endTime: args.details.endTime || null,
+        autoplay: args.details.autoplay || false,
+        muted: args.details.muted || false,
+      }),
+    ])
+  }
+  if (args.extraMetadata) {
+    fields.push(['extra_metadata', JSON.stringify(args.extraMetadata)])
+  }
+  return fields
+}
+
+/**
+ * Pure: the multipart entries for PUT /activities/video/{uuid} on a Google
+ * Drive activity — only `name` and the replacement `video_file`. Playback
+ * settings (start/end/autoplay/muted) belong to hosted videos and are never
+ * sent.
+ */
+export function buildGDriveVideoUpdateEntries(args: {
+  name?: string
+  videoFile?: Blob | null
+}): Array<[string, string | Blob]> {
+  const entries: Array<[string, string | Blob]> = []
+  if (typeof args.name === 'string' && args.name !== '') entries.push(['name', args.name])
+  if (args.videoFile) entries.push(['video_file', args.videoFile])
+  return entries
+}
+
+function normalizeVideoStorage(value: unknown): VideoStorage | undefined {
+  return value === 'gdrive' || value === 'server' ? value : undefined
+}
+
 export function createVideoActivityWithProgress(
   file: File,
   data: any,
   chapter_id: any,
   access_token: string,
-  onProgress: (_percent: number) => void
+  onProgress: (_percent: number) => void,
+  onUploaded?: () => void
 ): Promise<any> {
   const formData = new FormData()
-  formData.append('chapter_id', chapter_id)
-  formData.append('name', data.name)
-  formData.append('video_file', file)
-  if (data.details) {
-    formData.append(
-      'details',
-      JSON.stringify({
-        startTime: data.details.startTime || 0,
-        endTime: data.details.endTime || null,
-        autoplay: data.details.autoplay || false,
-        muted: data.details.muted || false,
-      })
-    )
+  for (const [key, value] of buildVideoFormFields({
+    name: data.name,
+    chapterId: chapter_id,
+    storage: normalizeVideoStorage(data.storage),
+    details: data.details,
+  })) {
+    formData.append(key, value)
   }
+  formData.append('video_file', file)
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest()
     xhr.open('POST', `${getAPIUrl()}activities/video`)
@@ -58,6 +117,9 @@ export function createVideoActivityWithProgress(
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable) onProgress((e.loaded / e.total) * 100)
     }
+    // The browser has finished sending the body. The server may still be busy
+    // (e.g. relaying the file to Google Drive) before it answers.
+    xhr.upload.onload = () => onUploaded?.()
     xhr.onload = () => {
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
@@ -92,28 +154,27 @@ export async function createFileActivity(
 ) {
   // Send file thumbnail as form data
   const formData = new FormData()
-  formData.append('chapter_id', chapter_id)
 
   let endpoint = ''
 
   if (type === 'video') {
-    formData.append('name', data.name)
-    formData.append('video_file', file)
-    // Add video details
-    if (data.details) {
-      formData.append('details', JSON.stringify({
-        startTime: data.details.startTime || 0,
-        endTime: data.details.endTime || null,
-        autoplay: data.details.autoplay || false,
-        muted: data.details.muted || false
-      }))
+    for (const [key, value] of buildVideoFormFields({
+      name: data.name,
+      chapterId: chapter_id,
+      storage: normalizeVideoStorage(data.storage),
+      details: data.details,
+    })) {
+      formData.append(key, value)
     }
+    formData.append('video_file', file)
     endpoint = `${getAPIUrl()}activities/video`
   } else if (type === 'documentpdf') {
+    formData.append('chapter_id', chapter_id)
     formData.append('pdf_file', file)
     formData.append('name', data.name)
     endpoint = `${getAPIUrl()}activities/documentpdf`
   } else {
+    formData.append('chapter_id', chapter_id)
     // Handle other file types here
   }
 
@@ -280,6 +341,29 @@ export async function updateHostedVideoActivity(
   formData.append('autoplay', String(videoDetails.autoplay))
   formData.append('muted', String(videoDetails.muted))
   if (videoFile) formData.append('video_file', videoFile)
+  const result = await fetch(
+    `${getAPIUrl()}activities/video/${activityUuid}`,
+    RequestBodyFormWithAuthHeader('PUT', formData, null, access_token)
+  )
+  return getResponseMetadata(result)
+}
+
+/**
+ * Update a Google Drive video activity: rename and/or replace the file. The
+ * playback fields of the hosted-video endpoint are deliberately never sent.
+ */
+export async function updateGDriveVideoActivity(
+  activityUuid: string,
+  args: { name?: string; videoFile?: File | null },
+  access_token: string
+) {
+  const formData = new FormData()
+  for (const [key, value] of buildGDriveVideoUpdateEntries({
+    name: args.name,
+    videoFile: args.videoFile,
+  })) {
+    formData.append(key, value)
+  }
   const result = await fetch(
     `${getAPIUrl()}activities/video/${activityUuid}`,
     RequestBodyFormWithAuthHeader('PUT', formData, null, access_token)

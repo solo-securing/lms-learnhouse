@@ -299,3 +299,107 @@ class TestRestoreActivityVersion:
                     mock_request, activity.activity_uuid, 999, admin_user, db
                 )
         assert exc.value.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Restoring a version of a Drive video activity (FR-004 / FR-014)
+# ---------------------------------------------------------------------------
+
+from src.db.courses.activities import ActivitySubTypeEnum  # noqa: E402
+from src.services.integrations.gdrive.errors import GDriveNotEnabledError  # noqa: E402
+
+_READY = "src.services.courses.activities.activities.require_ready"
+_FEATURE = "src.services.courses.activities.versioning.check_feature_access"
+_RBAC = "src.services.courses.activities.versioning.check_resource_access"
+_WEBHOOKS = "src.services.courses.activities.versioning.dispatch_webhooks"
+_STORAGE_CHANGE_DETAIL = "Video : Storage location of a video activity cannot be changed"
+
+
+async def _add_version(db, activity, number, content):
+    db.add(ActivityVersion(
+        activity_id=activity.id,
+        org_id=activity.org_id,
+        version_number=number,
+        content=content,
+        created_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    ))
+    await db.commit()
+
+
+async def _version_count(db, activity):
+    rows = (await db.execute(select(ActivityVersion).where(ActivityVersion.activity_id == activity.id))).scalars().all()
+    return len(rows)
+
+
+class TestRestoreVersionOnDriveActivity:
+    @pytest.mark.asyncio
+    async def test_refused_when_integration_not_ready(
+        self, mock_request, db, org, course, chapter, gdrive_activity, admin_user
+    ):
+        """A restore is a write to the Drive activity: without the integration ready it is
+        refused (409) and neither content, version counter nor snapshot table change."""
+        await _add_version(db, gdrive_activity, 1, dict(gdrive_activity.content))
+        original = dict(gdrive_activity.content)
+        version_before = gdrive_activity.current_version
+        snapshots_before = await _version_count(db, gdrive_activity)
+        with patch(_FEATURE, new_callable=AsyncMock), patch(_RBAC, new_callable=AsyncMock), patch(
+            _WEBHOOKS, new_callable=AsyncMock
+        ), patch(_READY, new_callable=AsyncMock, side_effect=GDriveNotEnabledError("off")):
+            with pytest.raises(HTTPException) as exc:
+                await restore_activity_version(mock_request, gdrive_activity.activity_uuid, 1, admin_user, db)
+        assert exc.value.status_code == 409
+        assert exc.value.detail == "Video : Google Drive storage is not enabled on this instance"
+        await db.refresh(gdrive_activity)
+        assert gdrive_activity.content == original
+        assert gdrive_activity.current_version == version_before
+        assert await _version_count(db, gdrive_activity) == snapshots_before
+
+    @pytest.mark.asyncio
+    async def test_refused_when_snapshot_points_at_other_drive_file(
+        self, mock_request, db, org, course, chapter, gdrive_activity, admin_user
+    ):
+        """After a replacement via PUT /activities/video/{uuid} (which takes no snapshot) an
+        older version still names the deleted file: restoring it must be refused."""
+        stale = {**gdrive_activity.content, "gdrive_file_id": "file_deleted_after_replace"}
+        await _add_version(db, gdrive_activity, 1, stale)
+        original = dict(gdrive_activity.content)
+        snapshots_before = await _version_count(db, gdrive_activity)
+        with patch(_FEATURE, new_callable=AsyncMock), patch(_RBAC, new_callable=AsyncMock), patch(
+            _WEBHOOKS, new_callable=AsyncMock
+        ), patch(_READY, new_callable=AsyncMock):
+            with pytest.raises(HTTPException) as exc:
+                await restore_activity_version(mock_request, gdrive_activity.activity_uuid, 1, admin_user, db)
+        assert exc.value.status_code == 409
+        assert exc.value.detail == _STORAGE_CHANGE_DETAIL
+        await db.refresh(gdrive_activity)
+        assert gdrive_activity.content == original
+        assert await _version_count(db, gdrive_activity) == snapshots_before
+
+    @pytest.mark.asyncio
+    async def test_allowed_when_snapshot_keeps_drive_keys(
+        self, mock_request, db, org, course, chapter, gdrive_activity, admin_user
+    ):
+        same_drive = {**gdrive_activity.content, "note": "from version 1"}
+        await _add_version(db, gdrive_activity, 1, same_drive)
+        version_before = gdrive_activity.current_version
+        with patch(_FEATURE, new_callable=AsyncMock), patch(_RBAC, new_callable=AsyncMock), patch(
+            _WEBHOOKS, new_callable=AsyncMock
+        ), patch(_READY, new_callable=AsyncMock) as ready:
+            result = await restore_activity_version(mock_request, gdrive_activity.activity_uuid, 1, admin_user, db)
+        ready.assert_awaited_once()
+        assert result.content == same_drive
+        assert result.content["gdrive_file_id"] == "file_abc123"
+        assert result.current_version == version_before + 1
+        assert result.activity_sub_type == ActivitySubTypeEnum.SUBTYPE_VIDEO_GDRIVE
+
+    @pytest.mark.asyncio
+    async def test_dynamic_page_restore_never_consults_readiness(
+        self, mock_request, db, activity, admin_user
+    ):
+        await _add_version(db, activity, 1, {"type": "doc", "restored": True})
+        with patch(_FEATURE, new_callable=AsyncMock), patch(_RBAC, new_callable=AsyncMock), patch(
+            _WEBHOOKS, new_callable=AsyncMock
+        ), patch(_READY, new_callable=AsyncMock, side_effect=GDriveNotEnabledError("off")) as ready:
+            result = await restore_activity_version(mock_request, activity.activity_uuid, 1, admin_user, db)
+        ready.assert_not_awaited()
+        assert result.content == {"type": "doc", "restored": True}
