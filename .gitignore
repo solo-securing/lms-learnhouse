@@ -62,9 +62,6 @@ apps/web/runtime-config.json
 # No trailing slash — must also match a bare symlink at apps/api/ee, not just a directory.
 apps/api/ee
 
-# Claude Code
-.claude/
-
 # Git worktrees
 .worktrees/
 
