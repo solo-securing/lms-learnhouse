@@ -27,3 +27,29 @@
   cursor: pointer;
   text-align: center;
 }
+
+/* Narrow players (responsive: true sets vjs-layout-*). Stock video.js keeps
+   PiP, mute and our extra buttons at full width, so on a phone the bar overflows
+   and fullscreen is clipped. Drop the least useful controls on touch-sized
+   players; play, ±15s, the progress bar and fullscreen always stay. */
+.learnhouse-player .video-js.vjs-layout-small .vjs-picture-in-picture-control,
+.learnhouse-player .video-js.vjs-layout-small .vjs-volume-panel,
+.learnhouse-player .video-js.vjs-layout-x-small .vjs-picture-in-picture-control,
+.learnhouse-player .video-js.vjs-layout-x-small .vjs-volume-panel,
+.learnhouse-player .video-js.vjs-layout-x-small .vjs-quality-selector,
+.learnhouse-player .video-js.vjs-layout-tiny .vjs-picture-in-picture-control,
+.learnhouse-player .video-js.vjs-layout-tiny .vjs-volume-panel,
+.learnhouse-player .video-js.vjs-layout-tiny .vjs-quality-selector,
+.learnhouse-player .video-js.vjs-layout-tiny .vjs-seek-back-15,
+.learnhouse-player .video-js.vjs-layout-tiny .vjs-seek-forward-15 {
+  display: none;
+}
+
+/* Stock x-small hides the progress bar, leaving a phone with no way to scrub.
+   Keep it; the controls dropped above leave it room. */
+.learnhouse-player .video-js.vjs-layout-x-small .vjs-progress-control {
+  display: flex;
+}
+.learnhouse-player .video-js.vjs-layout-x-small .vjs-custom-control-spacer {
+  display: none;
+}

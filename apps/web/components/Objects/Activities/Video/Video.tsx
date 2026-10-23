@@ -1,17 +1,89 @@
 import React from 'react'
 import YouTube from 'react-youtube'
 import { useTranslation } from 'react-i18next'
+import { useMediaQuery, useResizeObserver } from 'usehooks-ts'
 import { useOrg } from '@components/Contexts/OrgContext'
 import LearnHousePlayer from './LearnHousePlayer'
 import {
   DRIVE_OVERLAY_HEIGHT_PX,
+  DRIVE_PLAYER_MIN_HEIGHT_PX,
   isActivityHlsReady,
   isGDriveActivity,
   resolveActivityVideoSource,
   resolveDrivePreviewUrl,
+  resolveDriveTouchFrame,
   resolveHlsThumbnails,
   resolveActivityCaptions,
 } from './videoSource'
+
+const DRIVE_FRAME_CLASS =
+  'relative w-full sm:rounded-lg overflow-hidden ring-0 sm:ring-1 sm:ring-gray-200/10 sm:dark:ring-gray-700/20 shadow-none'
+
+/**
+ * Drive's own embed. On desktop it is a plain 16:9 box (never shorter than
+ * Drive's player). On a touch screen Drive switches to a touch player that only
+ * fits a near-square frame, so the iframe is laid out at that size and scaled
+ * down to the container width (see resolveDriveTouchFrame).
+ *
+ * The element tree is the same in both modes so switching never remounts the
+ * iframe. The strip sits inside the scaled layer, so it always covers the same
+ * part of Drive's own layout.
+ */
+function DriveEmbed({ src, title }: { src: string; title: string }) {
+  const boxRef = React.useRef<HTMLDivElement>(null)
+  const { width = 0 } = useResizeObserver({ ref: boxRef as React.RefObject<HTMLDivElement> })
+  const isTouch = useMediaQuery('(pointer: coarse)', { initializeWithValue: false })
+  const touchFrame = isTouch ? resolveDriveTouchFrame(width) : null
+
+  return (
+    <div
+      ref={boxRef}
+      className={DRIVE_FRAME_CLASS}
+      style={
+        touchFrame
+          ? { height: touchFrame.boxHeight }
+          : { aspectRatio: '16 / 9', minHeight: DRIVE_PLAYER_MIN_HEIGHT_PX }
+      }
+    >
+      {/* dir="ltr" + physical left/origin: the scale maps Drive's frame onto the
+          box from its top-left corner whatever the page direction. */}
+      <div
+        dir="ltr"
+        className="absolute top-0"
+        style={
+          touchFrame
+            ? {
+                left: 0,
+                width: touchFrame.width,
+                height: touchFrame.height,
+                transform: `scale(${touchFrame.scale})`,
+                transformOrigin: 'top left',
+              }
+            : { left: 0, width: '100%', height: '100%' }
+        }
+      >
+        <iframe
+          src={src}
+          title={title}
+          className="absolute inset-0 w-full h-full border-0"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
+          allowFullScreen
+          referrerPolicy="no-referrer"
+          allow="fullscreen"
+        />
+        {/* Transparent strip stacked above the embed's top bar so its
+            open/share affordances can't be clicked. It must stay a normal div
+            (no pointer-events:none). */}
+        <div
+          aria-hidden="true"
+          tabIndex={-1}
+          className="absolute inset-x-0 top-0 z-10"
+          style={{ height: DRIVE_OVERLAY_HEIGHT_PX }}
+        />
+      </div>
+    </div>
+  )
+}
 
 interface VideoDetails {
   startTime?: number
@@ -97,30 +169,11 @@ function VideoActivity({ activity, course, orgUuid }: VideoActivityProps) {
         <>
           {isGDrive && (
             <div className="my-0 sm:my-3 md:my-5 w-full">
-              <div className="relative w-full aspect-video sm:rounded-lg overflow-hidden ring-0 sm:ring-1 sm:ring-gray-200/10 sm:dark:ring-gray-700/20 shadow-none">
-                {drivePreviewUrl ? (
-                  <>
-                    <iframe
-                      src={drivePreviewUrl}
-                      title={t('activities.video_gdrive.label')}
-                      className="absolute inset-0 w-full h-full border-0"
-                      sandbox="allow-scripts allow-same-origin allow-forms allow-presentation"
-                      allowFullScreen
-                      referrerPolicy="no-referrer"
-                      allow="fullscreen"
-                    />
-                    {/* Transparent strip stacked above the embed's top bar so
-                        its open/share affordances can't be clicked. It must
-                        stay a normal div (no pointer-events:none). */}
-                    <div
-                      aria-hidden="true"
-                      tabIndex={-1}
-                      className="absolute inset-x-0 top-0 z-10"
-                      style={{ height: DRIVE_OVERLAY_HEIGHT_PX }}
-                    />
-                  </>
-                ) : null}
-              </div>
+              {drivePreviewUrl ? (
+                <DriveEmbed src={drivePreviewUrl} title={t('activities.video_gdrive.label')} />
+              ) : (
+                <div className={`${DRIVE_FRAME_CLASS} aspect-video`} />
+              )}
               <p className="mt-2 text-xs text-gray-500">
                 {t('activities.video_gdrive.embed_hint')}
               </p>

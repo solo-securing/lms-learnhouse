@@ -196,9 +196,11 @@ export default function FixedActivitySecondaryBar(props: FixedActivitySecondaryB
 
   if (!shouldShow) return null;
 
+  // Hidden below sm: on a phone the stacked header plus this bar would cover
+  // most of a 16:9 player, and Prev/Next already sit right under the content.
   return (
     <div
-      className={`fixed top-[60px] start-0 end-0 bg-white/90 backdrop-blur-xl transition-all duration-300 animate-in fade-in slide-in-from-top ${
+      className={`hidden sm:block fixed top-[60px] start-0 end-0 bg-white/90 backdrop-blur-xl transition-all duration-300 animate-in fade-in slide-in-from-top ${
         isScrolled ? 'nice-shadow' : ''
       }`}
       style={{ zIndex: 'var(--z-drag-overlay)' }}

@@ -137,6 +137,10 @@ const LearnHousePlayer: React.FC<LearnHousePlayerProps> = ({
         // loads or if the source errors. `fluid` sized from metadata, so a slow/
         // broken source left the player collapsed with no visible controls.
         fill: true,
+        // responsive tags the player with vjs-layout-* classes by its own width,
+        // so a phone-sized player drops controls instead of overflowing and
+        // clipping fullscreen off the end of the bar (see player-controls.css).
+        responsive: true,
         preload: 'metadata',
         poster: poster || undefined,
         autoplay: !!details?.autoplay,

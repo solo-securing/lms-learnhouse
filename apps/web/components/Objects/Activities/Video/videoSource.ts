@@ -170,6 +170,55 @@ export function resolveActivityCaptions(
  */
 export const DRIVE_OVERLAY_HEIGHT_PX = 56
 
+/**
+ * Minimum height (px) of the Drive embed frame. Drive never lays its player out
+ * shorter than 300px: in a shorter frame (a 16:9 box on a phone is ~190px) the
+ * bottom is cropped, taking the controls and most of the picture with it.
+ * Above ~534px wide the 16:9 box is already taller and this has no effect.
+ */
+export const DRIVE_PLAYER_MIN_HEIGHT_PX = 300
+
+/**
+ * Touch devices get Drive's touch player, whose layout depends on frame size:
+ *   - wider than tall (every 16:9 size): the seek bar is pinned to the very top,
+ *     under the strip above, and the play/pause row is cropped off the bottom;
+ *   - near-square, ~410–500px wide: big seek bar and play/pause rows laid over
+ *     the middle of the picture;
+ *   - near-square, ≥ ~520px wide: one compact seek bar + button row BELOW the
+ *     picture, nothing over it. 560px also fits the time display.
+ * Its buttons are a fixed pixel size while the picture grows with the frame, so
+ * on touch screens narrower than DRIVE_TOUCH_MAX_CONTAINER_PX the embed is laid
+ * out at this size and scaled down to fit (≈0.6 on a phone, buttons ≈31px).
+ */
+export const DRIVE_TOUCH_FRAME_WIDTH_PX = 560
+export const DRIVE_TOUCH_FRAME_HEIGHT_PX = 588
+/** Container width (px) from which the touch layout is no longer applied. */
+export const DRIVE_TOUCH_MAX_CONTAINER_PX = 640
+
+export interface DriveTouchFrame {
+  /** Size the iframe is laid out at, before scaling. */
+  width: number
+  height: number
+  /** Factor that maps the laid-out frame onto the container width (≤ 1). */
+  scale: number
+  /** Height the container must take to show the scaled frame. */
+  boxHeight: number
+}
+
+/**
+ * Geometry of the Drive embed on a touch screen whose container is
+ * `containerWidth` px wide. Null when the touch layout does not apply (no width
+ * measured yet, or a container too wide for it).
+ */
+export function resolveDriveTouchFrame(containerWidth: number): DriveTouchFrame | null {
+  if (!(containerWidth > 0) || containerWidth >= DRIVE_TOUCH_MAX_CONTAINER_PX) return null
+  const ratio = DRIVE_TOUCH_FRAME_HEIGHT_PX / DRIVE_TOUCH_FRAME_WIDTH_PX
+  const width = Math.max(containerWidth, DRIVE_TOUCH_FRAME_WIDTH_PX)
+  const height = Math.round(width * ratio)
+  const scale = containerWidth / width
+  return { width, height, scale, boxHeight: height * scale }
+}
+
 /** True for a video activity whose file lives on the operator's Google Drive. */
 export function isGDriveActivity(
   activity: { activity_sub_type?: string } | null | undefined

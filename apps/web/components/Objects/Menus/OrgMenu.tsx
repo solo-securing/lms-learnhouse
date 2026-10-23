@@ -381,7 +381,7 @@ export const OrgMenu = (props: any) => {
       </nav>
       <div
         className={`fixed inset-x-0 bg-white/80 backdrop-blur-lg md:hidden shadow-lg transition-all duration-300 ease-in-out ${
-          isMenuOpen ? 'opacity-100' : '-top-full opacity-0'
+          isMenuOpen ? 'opacity-100' : '-top-full opacity-0 invisible pointer-events-none'
         }`}
         style={{
           zIndex: 'var(--z-nav-menu)',
